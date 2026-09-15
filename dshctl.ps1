@@ -50,7 +50,7 @@ $URL = "http://${DEFAULT_HOST}:${DEFAULT_PORT}"
 
 # dshctl 自身版本与远端基址：update 自更新时对比仓库根的 VERSION 文件。
 # 发版约定：改这里的同时改仓库根 VERSION，两处一致才放行。
-$DSHCTL_VERSION = "0.4.1"
+$DSHCTL_VERSION = "0.4.2"
 $DSHCTL_RAW_BASE = "https://raw.githubusercontent.com/stofancy/dshctl/main"
 
 # 状态目录
@@ -199,17 +199,26 @@ function Get-InstalledVersion {
 # 获取服务可执行文件路径
 function Get-ServiceBin {
     param([string]$Source = (Get-CurrentSource))
-    
+
     if ($Source -eq "local") {
         return Join-Path $LOCAL_SLOT "bin\dsh"
     } else {
-        # 官方槽位：全局 npm
+        # 官方槽位：全局 npm。入口不猜——从已装包的 package.json 读 bin.dsh
+        # （真实入口是 lib/bin.js，写死路径会随上游包结构变化而失效）。
+        $globalRoot = (npm root -g 2>$null | Select-Object -First 1)
+        if (-not $globalRoot) { return $null }
+        $pkgDir = Join-Path $globalRoot "@deepseek-ai\dsh"
+        $pkgJson = Join-Path $pkgDir "package.json"
+        if (-not (Test-Path $pkgJson)) { return $null }
         try {
-            $globalRoot = npm root -g 2>$null
-            return Join-Path $globalRoot "@deepseek-ai\dsh\dist\index.js"
+            $bin = (Get-Content $pkgJson -Raw | ConvertFrom-Json).bin.dsh
+            if ($bin -is [string] -and $bin) {
+                return Join-Path $pkgDir $bin
+            }
         } catch {
             return $null
         }
+        return $null
     }
 }
 

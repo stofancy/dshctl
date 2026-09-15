@@ -40,7 +40,7 @@ PACKAGE_NAME="@deepseek-ai/dsh"
 
 # dshctl 自身版本与远端基址：update 自更新时对比仓库根的 VERSION 文件。
 # 发版约定：改这里的同时改仓库根 VERSION，两处一致才放行。
-DSHCTL_VERSION="0.4.1"
+DSHCTL_VERSION="0.4.2"
 DSHCTL_RAW_BASE="https://raw.githubusercontent.com/stofancy/dshctl/main"
 
 # 预演开关：由入口的 --dry-run 置 1；只打印将要执行的来源与制品，不安装、不切换、不重启。
