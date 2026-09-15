@@ -1,0 +1,1009 @@
+#!/usr/bin/env bash
+# dshctl —— dsh web 服务一站式管理 wrapper
+# 把底层 systemctl / journalctl / npm 命令全部包进来。
+# 用法一（傻瓜模式）：直接敲 dshctl 回车，按数字菜单选。
+# 用法二（快捷模式）：dshctl <子命令>，如：
+#   dshctl update [通道|版本]      安装/升级官方包（全局槽位），并按需切换
+#   dshctl update --local [路径]   构建/安装本地包到本地槽位，并按需切换
+#   dshctl use official|local      只切换运行哪个槽位（不重装）
+#   dshctl source                  查看当前运行来源、两个槽位的版本
+#   dshctl update ... --dry-run    预演：只看来源与制品，不安装不切换不重启
+#   dshctl update ... --no-restart 只安装并切换配置，不重启服务
+#   dshctl check [official|local]  预检：用当前 profile 试启目标槽位，不切换不重启
+#   dshctl help                    查看完整说明
+#
+# 两条硬规则，都是踩过坑之后加的：
+#   1. 命令行里出现 help / -h / --help 就只打印帮助，绝不执行子命令（曾因
+#      `dshctl use official --help` 把 --help 当普通参数吞掉而真的切了槽位）；
+#      其余「- 开头」的未知参数一律拒绝执行，不猜。
+#   2. 切换槽位前先用当前 profile 在临时 DSH_HOME + 空闲端口上试启目标槽位；
+#      起不来就拒绝切换，线上服务一动不动（曾因官方包的 token-meter 不认识
+#      profile 里的 cost 段，切过去后服务直接起不来）。
+#
+# 「双槽位」模型：官方包和本地包各自装在自己家里，互不覆盖，dshctl 只决定运行哪一个。
+#   官方槽位（registry）—— 全局 npm 树（npm install -g @deepseek-ai/dsh@<通道或版本>）；
+#   本地槽位（local）   —— 独立 prefix（默认 ~/.local/share/dshctl/slot-local），
+#                          由本地构建的整族 tarball 安装，并把 profile 自带的第三方
+#                          插件（如 dshmarket）并入槽位，保证它也能启动同一个 profile。
+# 运行哪个槽位由 systemd drop-in 决定：
+#   文件不存在 → 跑官方槽位（unit 原本的 ExecStart）；
+#   文件存在   → 跑本地槽位（ExecStart 指向槽位的 bin），删除它即回官方槽位。
+# 切换只是写/删一个 drop-in 再重启，秒级完成；另一个槽位始终完好，随时能切回去继续用。
+# 本地包不写全局 npm 树：对它 npm install -g 会把“不属于本次安装集”的包清掉（曾因此
+# 删掉 dshmarket 等插件、服务起不来）。
+set -u
+
+UNIT="dsh-web.service"
+URL="http://127.0.0.1:3080"
+HELP="$HOME/.config/dsh-web-help.txt"
+PACKAGE_NAME="@deepseek-ai/dsh"
+
+# 预演开关：由入口的 --dry-run 置 1；只打印将要执行的来源与制品，不安装、不切换、不重启。
+DRY_RUN=0
+# 重启开关：由入口的 --no-restart 置 0；装完不重启（分阶段部署 / 手工安排重启时用）。
+RESTART=1
+
+# ── 状态与槽位 ───────────────────────────────────────────────────────────
+STATE_DIR="$HOME/.config/dsh"
+CHANNEL_FILE="$STATE_DIR/channel"           # 官方槽位的 dist-tag 记忆
+LOCAL_PATH_FILE="$STATE_DIR/local-path"     # 本地槽位的制品来源记忆
+LOCAL_DETAIL_FILE="$STATE_DIR/local-detail" # 本地槽位的制品描述（展示用）
+
+# 本地来源的打包输出目录。源码仓库构建后打包到这里，再交给 npm 安装。
+# 可用 DSHCTL_PACK_DIR 覆盖。
+LOCAL_PACK_DIR="${DSHCTL_PACK_DIR:-$HOME/.cache/dshctl/pack}"
+
+# 本地槽位：独立 prefix，与全局 npm 树完全隔离。
+LOCAL_SLOT="${DSHCTL_SLOT_DIR:-$HOME/.local/share/dshctl/slot-local}"
+
+# 拉起本地槽位时 node 要带的 flag。本地构建默认启用 profile 热重载（HMR），
+# 它要求进程带 --expose-internals，而 NODE_OPTIONS 不接受这个 flag，只能直接调 node。
+LOCAL_NODE_FLAGS="${DSHCTL_LOCAL_NODE_FLAGS:---expose-internals}"
+
+# 运行槽位的开关：drop-in 存在 = 跑本地槽位，不存在 = 跑官方槽位。
+# 「当前来源」以它为唯一事实来源，不再单独记状态，手工删改也不会让状态撒谎。
+DROPIN_DIR="$HOME/.config/systemd/user/$UNIT.d"
+DROPIN="$DROPIN_DIR/50-dshctl-slot.conf"
+LEGACY_DROPIN="$DROPIN_DIR/50-dshctl-source.conf"
+
+# ── 状态读写 ─────────────────────────────────────────────────────────────
+# 读取枚举型状态。文件缺失或不可读时输出空串，由调用方决定回退值；
+# 绝不因为状态文件损坏而中断。
+read_state() {
+    local file="$1"
+    [ -r "$file" ] || return 0
+    tr -d '[:space:]' < "$file" 2>/dev/null
+}
+
+# 读取路径型状态。只去掉行尾换行，保留路径中的空格。
+read_path_state() {
+    local file="$1"
+    [ -r "$file" ] || return 0
+    cat "$file" 2>/dev/null
+}
+
+# 原子写入一行状态：先写临时文件再 mv，避免中断留下截断内容把记忆弄坏。
+write_state() {
+    local file="$1" value="$2" tmp="$1.tmp.$$"
+    mkdir -p "$(dirname "$file")" || return 1
+    if printf '%s\n' "$value" > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$file"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# ── 通用工具 ─────────────────────────────────────────────────────────────
+# dist-tag 只认这三个；也允许显式版本号（形如 0.1.5-rc.2）。
+valid_channel() {
+    case "$1" in
+        latest|next|alpha) return 0 ;;
+        [0-9]*.[0-9]*.[0-9]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 当前更新通道。记忆文件缺失、为空或含非法值时回落 latest——
+# 否则一个手改坏的值会让此后每次裸 update 都永久失败（写回在安装成功之后，无法自愈）。
+current_channel() {
+    local c=""
+    c=$(read_state "$CHANNEL_FILE")
+    if [ -n "$c" ] && valid_channel "$c"; then
+        printf '%s' "$c"
+    else
+        [ -n "$c" ] && echo "⚠ 记忆的更新通道无效（$c），本次回退 latest" >&2
+        printf 'latest'
+    fi
+}
+
+# 当前实际在跑的 dsh 版本；读不到时报「未知」，不中断流程。
+installed_version() {
+    local bin
+    bin=$(service_bin)
+    if [ -n "$bin" ] && [ -x "$bin" ]; then
+        "$bin" --version 2>/dev/null || echo 未知
+    else
+        echo 未知
+    fi
+}
+
+# 全局 npm 根目录（官方槽位所在）。惰性求值，避免每条命令都调 npm。
+global_root() {
+    if [ -z "${GLOBAL_ROOT_CACHE:-}" ]; then
+        GLOBAL_ROOT_CACHE="${DSHCTL_GLOBAL_ROOT:-$(npm root -g 2>/dev/null)}"
+    fi
+    printf '%s' "$GLOBAL_ROOT_CACHE"
+}
+
+# 带旋转指示器的后台执行：spinner <描述> -- cmd...
+spinner() {
+    local desc="$1"; shift
+    [ "$1" = "--" ] && shift
+    local frames='|/-\' i=0
+    "$@" &
+    local pid=$!
+    # 非 TTY 或非交互时不画 spinner，只等结果
+    if [ ! -t 2 ]; then
+        wait "$pid"; return $?
+    fi
+    printf '  %s ' "$desc"
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\b%c' "${frames:i++%4:1}"
+        sleep 0.15
+    done
+    wait "$pid"; local rc=$?
+    printf '\b'
+    if [ $rc -eq 0 ]; then echo "✔ 完成"
+    elif [ $rc -eq 124 ]; then echo "✘ 超时"
+    else echo "✘ 失败 (exit=$rc)"; fi
+    return $rc
+}
+
+# ── 运行槽位（双槽位切换的唯一开关）──────────────────────────────────────
+# 切换 = 写/删一个 systemd drop-in + daemon-reload，不碰任何安装内容，
+# 也不需要改用户手写的 unit 文件（参数从 unit 文件原样取用）。
+
+# unit 文件里原始 ExecStart 整行。读 FragmentPath 指向的 unit 文件本身，
+# 而不是 systemctl cat（后者会把我们的 drop-in 也算进来）。
+unit_exec_start() {
+    local fragment start
+    fragment=$(systemctl --user show "$UNIT" -p FragmentPath --value 2>/dev/null)
+    if [ -z "$fragment" ] || [ ! -r "$fragment" ]; then
+        echo "读不到 $UNIT 的 unit 文件（FragmentPath=${fragment:-空}）" >&2
+        return 1
+    fi
+    start=$(sed -n 's/^ExecStart=//p' "$fragment" | head -1)
+    if [ -z "$start" ]; then
+        echo "unit 文件里没有 ExecStart：$fragment" >&2
+        return 1
+    fi
+    printf '%s' "$start"
+}
+
+# 官方槽位的可执行文件（unit 原本 ExecStart 的第一个词）。
+unit_bin() {
+    local start
+    start=$(unit_exec_start 2>/dev/null) || return 0
+    printf '%s' "${start%% *}"
+}
+
+# 原始 ExecStart 里可执行文件之后的参数（原样保留 host/port 等）。
+unit_arguments() {
+    local start
+    start=$(unit_exec_start) || return 1
+    printf '%s' "${start#* }"
+}
+
+# 服务下次启动会用的可执行文件。
+service_bin() {
+    if [ -f "$DROPIN" ]; then
+        printf '%s' "$LOCAL_SLOT/bin/dsh"
+        return 0
+    fi
+    unit_bin
+}
+
+# 把运行槽位指向本地槽位。
+# 用 node 直接拉起槽位入口（而不是槽位的 bin 脚本），因为本地构建的 profile 热重载
+# 需要 --expose-internals，而该 flag 不允许放进 NODE_OPTIONS。
+service_bind_local() {
+    local bin="$LOCAL_SLOT/bin/dsh" entry node args
+    if [ ! -x "$bin" ]; then
+        echo "本地槽位里没有可执行的 dsh：$bin" >&2
+        return 1
+    fi
+    node=$(command -v node 2>/dev/null || true)
+    entry=$(readlink -f "$bin" 2>/dev/null || true)
+    if [ -z "$node" ] || [ -z "$entry" ] || [ ! -f "$entry" ]; then
+        echo "找不到 node（$node）或槽位入口（$entry），无法切换本地槽位" >&2
+        return 1
+    fi
+    args=$(unit_arguments) || return 1
+    mkdir -p "$DROPIN_DIR" || return 1
+    cat > "$DROPIN" <<EOF
+# 由 dshctl 写入：把 dsh-web 指向本地槽位。
+# 删除本文件（或执行 dshctl use official）即回官方槽位。
+[Service]
+ExecStart=
+ExecStart=$node $LOCAL_NODE_FLAGS $entry $args
+EOF
+    systemctl --user daemon-reload
+}
+
+# 把运行槽位交回官方包。
+service_bind_registry() {
+    local changed=0
+    for f in "$DROPIN" "$LEGACY_DROPIN"; do
+        if [ -f "$f" ]; then rm -f "$f"; changed=1; fi
+    done
+    rmdir "$DROPIN_DIR" 2>/dev/null || true
+    [ "$changed" = "1" ] && systemctl --user daemon-reload
+    return 0
+}
+
+# 某个槽位的已装版本，供 show_source 展示。
+slot_version() {
+    local source="$1" bin=""
+    case "$source" in
+        local)    bin="$LOCAL_SLOT/bin/dsh" ;;
+        registry) bin=$(unit_bin) ;;
+    esac
+    if [ -n "$bin" ] && [ -x "$bin" ]; then
+        "$bin" --version 2>/dev/null || echo 未知
+    else
+        echo 未安装
+    fi
+}
+
+# ── 安装来源 ─────────────────────────────────────────────────────────────
+# 每个来源实现七个契约函数，安装主流程只按名字调用（开闭原则）：
+#   <来源>_label             来源的中文名
+#   <来源>_validate <目标>   校验目标；返回 0 合法 / 2 不合法（自行打印原因）
+#   <来源>_describe <目标>   一行描述本次要装什么
+#   <来源>_install  <目标>   执行安装；返回 0 成功 / 非 0 失败
+#   <来源>_remember <目标>   安装成功后写来源记忆并把运行槽位指向它
+#   <来源>_bind              只切换运行槽位（供 dshctl use 与失败回退使用）
+#   <来源>_ready             该槽位是否可用
+#   <来源>_cmd <端口>        该槽位在指定端口的启动命令行（供切换前预检试启）
+# 新增来源 = 实现这七个函数 + 在 SOURCES 登记一个名字，其余流程不动。
+SOURCES="registry local"
+
+source_known() {
+    case " $SOURCES " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 当前运行来源 = 服务下次启动会跑哪个槽位。事实来源是 drop-in，手工删改也不会撒谎。
+current_source() {
+    if [ -f "$DROPIN" ]; then printf 'local'; else printf 'registry'; fi
+}
+
+# ── 来源：官方 npm 包（全局槽位）─────────────────────────────────────────
+registry_label() { printf '官方包'; }
+
+# 目标标签：显式值优先，否则沿用记忆的通道。
+registry_resolve() {
+    printf '%s' "${1:-$(current_channel)}"
+}
+
+registry_validate() {
+    local tag
+    tag=$(registry_resolve "$1")
+    if ! valid_channel "$tag"; then
+        echo "无效的通道或版本：$tag" >&2
+        echo "可用：latest / next / alpha，或显式版本号（如 0.1.5-rc.2）" >&2
+        return 2
+    fi
+}
+
+registry_describe() {
+    printf '官方包 %s@%s（npm 全局树）' "$PACKAGE_NAME" "$(registry_resolve "$1")"
+}
+
+registry_install() {
+    local tag
+    tag=$(registry_resolve "$1")
+    if ! spinner "npm 全局安装中" -- \
+        npm install -g "$PACKAGE_NAME@$tag" --fetch-timeout=120000 --fetch-retries=3; then
+        return 1
+    fi
+    local installed remote
+    installed=$(slot_version registry)
+    remote=$(npm view "$PACKAGE_NAME@$tag" version 2>/dev/null || true)
+    if [ -n "$remote" ] && [ "$installed" != "$remote" ]; then
+        echo "⚠ 安装后版本为 $installed，与通道 $tag 的 $remote 不一致，请检查" >&2
+    fi
+}
+
+registry_remember() {
+    write_state "$CHANNEL_FILE" "$(registry_resolve "$1")"
+    service_bind_registry
+}
+
+registry_bind() { service_bind_registry; }
+
+registry_ready() {
+    local bin
+    bin=$(unit_bin)
+    [ -n "$bin" ] && [ -x "$bin" ]
+}
+
+# ── 来源：本地包（本地槽位）──────────────────────────────────────────────
+# 目标有三种形态，local_kind 统一识别：
+#   checkout  —— 源码仓库（含 pnpm-workspace.yaml 且定义了 release:pack）：构建并打包；
+#   artifacts —— 已打包目录（顶层有 *.tgz）：直接安装；
+#   tarball   —— 单个 .tgz：只装这一件，其工作区兄弟依赖仍由 npm 从 registry 解析。
+local_label() { printf '本地包'; }
+
+# 本地目标：显式路径优先，否则用记住的路径。
+local_target() {
+    printf '%s' "${1:-$(read_path_state "$LOCAL_PATH_FILE")}"
+}
+
+# 识别本地目标的形态；无法识别时输出空串。
+local_kind() {
+    local path="$1" tarball
+    if [ -f "$path" ]; then
+        case "$path" in
+            *.tgz) printf 'tarball' ;;
+        esac
+        return 0
+    fi
+    [ -d "$path" ] || return 0
+    tarball=$(find "$path" -maxdepth 1 -type f -name '*.tgz' -print -quit 2>/dev/null)
+    if [ -n "$tarball" ]; then
+        printf 'artifacts'
+    elif [ -f "$path/pnpm-workspace.yaml" ] && [ -f "$path/package.json" ] \
+        && grep -q '"release:pack"' "$path/package.json" 2>/dev/null; then
+        printf 'checkout'
+    fi
+}
+
+local_validate() {
+    local target kind
+    target=$(local_target "$1")
+    if [ -z "$target" ]; then
+        echo "未指定本地包路径，也没有记住过路径。" >&2
+        echo "用法：dshctl update --local <源码仓库 | 已打包的 tgz 目录 | 单个 .tgz>" >&2
+        return 2
+    fi
+    if [ ! -e "$target" ]; then
+        echo "本地路径不存在：$target" >&2
+        return 2
+    fi
+    kind=$(local_kind "$target")
+    if [ -z "$kind" ]; then
+        echo "无法识别的本地路径：$target" >&2
+        echo "需要源码仓库（含 pnpm-workspace.yaml 与 release:pack 脚本）、含 *.tgz 的目录，或 .tgz 文件。" >&2
+        return 2
+    fi
+}
+
+# 收集待安装的 tarball：文件就是它自己，目录取顶层 *.tgz。
+collect_tarballs() {
+    local item
+    for item in "$@"; do
+        if [ -f "$item" ]; then
+            printf '%s\n' "$item"
+        elif [ -d "$item" ]; then
+            find "$item" -maxdepth 1 -type f -name '*.tgz' | sort
+        fi
+    done
+}
+
+local_tarball_count() {
+    collect_tarballs "$1" | wc -l | tr -d '[:space:]'
+}
+
+local_describe() {
+    local target kind
+    target=$(local_target "$1")
+    kind=$(local_kind "$target")
+    case "$kind" in
+        checkout)  printf '本地源码 %s（build:official 构建 + release:pack 打包 → 本地槽位）' "$target" ;;
+        artifacts) printf '本地制品目录 %s（%s 个 tarball → 本地槽位）' "$target" "$(local_tarball_count "$target")" ;;
+        tarball)   printf '本地 tarball %s（单个制品 → 本地槽位）' "$target" ;;
+        *)         printf '本地 %s' "$target" ;;
+    esac
+}
+
+# 源码仓库：完整官方构建 + 两族打包到 LOCAL_PACK_DIR。
+# vendor 与 dsh 各自打包到子目录，因为 pack.ts 会先清空自己的输出目录。
+local_pack_checkout() {
+    local repo="$1" out="$LOCAL_PACK_DIR"
+    echo "  构建 $repo（native + lib + web，可能需要数分钟）"
+    if ! spinner "构建中" -- pnpm --dir "$repo" run build:official; then
+        return 1
+    fi
+    if ! spinner "打包 vendor 族" -- \
+        pnpm --dir "$repo" run release:pack --family vendor --out "$out/vendor"; then
+        return 1
+    fi
+    if ! spinner "打包 dsh 族" -- \
+        pnpm --dir "$repo" run release:pack --family dsh --out "$out/dsh"; then
+        return 1
+    fi
+}
+
+# 把两族 tarball 汇总到一个平坦目录：安装只认一个目录，
+# 同时留下「跳过构建、直接重装同一批制品」的入口。
+local_flatten_artifacts() {
+    local out="$1" flat tarball
+    flat="$out/artifacts"
+    rm -rf "$flat"
+    mkdir -p "$flat" || return 1
+    while IFS= read -r tarball; do
+        cp -f "$tarball" "$flat/" || return 1
+    done < <(collect_tarballs "$out/vendor" "$out/dsh")
+    printf '%s\n' "$flat"
+}
+
+# profile 自己声明的第三方 bundle（不在整族包里的，例如 dshmarket）必须也能从槽位解析，
+# 否则槽位启动时报 Cannot find package <plugin>。它们本就住在 profile 项目里，故软链过去。
+profile_bundle_names() {
+    node -e 'const m=require(process.argv[1]);for(const b of m.dsh?.profile?.bundles??[])console.log(b)' "$1" 2>/dev/null
+}
+
+link_profile_plugins() {
+    local modules="$LOCAL_SLOT/lib/node_modules" profile name src linked=0
+    for profile in "$HOME"/.dsh/profiles/*; do
+        [ -f "$profile/package.json" ] || continue
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            [ -e "$modules/$name" ] && continue
+            src="$profile/node_modules/$name"
+            [ -d "$src" ] || continue
+            mkdir -p "$(dirname "$modules/$name")" || return 1
+            ln -sfn "$src" "$modules/$name" || return 1
+            linked=$((linked + 1))
+        done < <(profile_bundle_names "$profile/package.json")
+    done
+    echo "  已并入 profile 自带插件 $linked 个（软链到 profile 自己的安装）"
+}
+
+local_install() {
+    local target kind
+    target=$(local_target "$1")
+    kind=$(local_kind "$target")
+
+    local -a sources=()
+    case "$kind" in
+        checkout)
+            local_pack_checkout "$target" || return 1
+            local flat
+            flat=$(local_flatten_artifacts "$LOCAL_PACK_DIR") || return 1
+            echo "  制品目录：$flat（之后可用 dshctl update --local $flat 跳过构建直接重装）"
+            sources=("$flat")
+            ;;
+        artifacts) sources=("$target") ;;
+        tarball)   sources=("$target") ;;
+    esac
+
+    local -a tarballs=()
+    mapfile -t tarballs < <(collect_tarballs "${sources[@]}")
+    if [ "${#tarballs[@]}" -eq 0 ]; then
+        echo "  未找到任何 .tgz 制品：${sources[*]}" >&2
+        return 1
+    fi
+    echo "  制品：${#tarballs[@]} 个 tarball（本地构建的整族包）"
+    echo "  装入本地槽位：$LOCAL_SLOT（与全局 npm 树完全隔离，不动正在运行的服务）"
+    if ! spinner "npm 安装中" -- \
+        npm install -g --prefix "$LOCAL_SLOT" --no-audit --no-fund \
+        --fetch-timeout=120000 --fetch-retries=3 "${tarballs[@]}"; then
+        return 1
+    fi
+    link_profile_plugins || return 1
+    # 切换运行槽位之前先冒烟：装坏的本地包绝不能带下水。
+    local version
+    if ! version=$("$LOCAL_SLOT/bin/dsh" --version 2>/dev/null); then
+        echo "  本地槽位自检失败（$LOCAL_SLOT/bin/dsh --version 未通过），保持当前来源不变" >&2
+        return 1
+    fi
+    echo "  本地槽位自检通过：dsh --version = $version"
+}
+
+local_remember() {
+    local target kind detail commit
+    target=$(local_target "$1")
+    kind=$(local_kind "$target")
+    detail="$kind @ $(date '+%Y-%m-%d %H:%M')"
+    if [ "$kind" = "checkout" ]; then
+        commit=$(git -C "$target" rev-parse --short HEAD 2>/dev/null)
+        [ -n "$commit" ] && detail="$detail commit $commit"
+    fi
+    write_state "$LOCAL_PATH_FILE" "$target"
+    write_state "$LOCAL_DETAIL_FILE" "$detail"
+    service_bind_local
+}
+
+local_bind() { service_bind_local; }
+
+local_ready() {
+    local bin="$LOCAL_SLOT/bin/dsh"
+    [ -x "$bin" ] && "$bin" --version >/dev/null 2>&1
+}
+
+# ── 安装主流程 ───────────────────────────────────────────────────────────
+do_install() {
+    local source="$1" target="${2:-}"
+    if ! source_known "$source"; then
+        echo "未知安装来源：$source（可用：$SOURCES）" >&2
+        return 2
+    fi
+    local validate="${source}_validate" describe="${source}_describe"
+    local install="${source}_install" remember="${source}_remember"
+
+    "$validate" "$target" || return $?
+
+    echo "── [1/4] 目标 ──"
+    echo "  来源：$("${source}_label")"
+    echo "  内容：$("$describe" "$target")"
+    echo "  当前运行：$("$(current_source)"_label)"
+
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "── [dry-run] 跳过安装、切换与重启（去掉 --dry-run 才会真正执行）──"
+        return 0
+    fi
+
+    local previous
+    previous=$(current_source)
+
+    echo "── [2/4] 安装 ──"
+    if ! "$install" "$target"; then
+        echo "安装失败：安装未成功，运行来源保持 $("${previous}_label")。" >&2
+        return 1
+    fi
+
+    echo "── [3/4] 切换前预检 ──"
+    if ! preflight_slot "$source"; then
+        echo "预检未通过：$("${source}_label") 装上了但用当前 profile 起不来；运行来源保持 $("${previous}_label")，未切换。" >&2
+        return 1
+    fi
+
+    echo "── [4/4] 切换槽位 ──"
+    if ! "$remember" "$target"; then
+        echo "切换失败：运行来源保持 $("${previous}_label")。" >&2
+        return 1
+    fi
+    if [ "$previous" != "$source" ]; then
+        echo "  运行来源：$("${previous}_label") → $("${source}_label")"
+    fi
+
+    if [ "$RESTART" = "0" ]; then
+        echo "── 已按 --no-restart 跳过重启；下次启动用 $("${source}_label") ──"
+        return 0
+    fi
+
+    restart_checked "$previous"
+}
+
+# 重启并确认服务真的起来了；起不来就切回上一个来源再重启一次——
+# 「一个槽位坏了也不能让线上服务躺着」是这条路径的硬约束。
+restart_checked() {
+    local fallback="${1:-}"
+    restart_service && return 0
+    if [ -n "$fallback" ] && [ "$fallback" != "$(current_source)" ] \
+        && source_known "$fallback" && "${fallback}_ready"; then
+        echo "  服务未起来，切回 $("${fallback}_label")…" >&2
+        if "${fallback}_bind" && restart_service; then
+            echo "  已切回 $("${fallback}_label")，服务恢复运行；可用 dshctl source 查看" >&2
+        fi
+    fi
+    return 1
+}
+
+# 等待服务真正可用：进程 active，且根路径给出应用级应答（认证重定向 3xx 或 401）。
+# 连不上、404、5xx 都算没起来——实测本地槽位缺 node flag 时正是先 404 再崩，
+# 只看 systemctl is-active 会漏判（进程起来一秒后照样退出）。
+wait_healthy() {
+    local i code
+    if ! command -v curl >/dev/null 2>&1; then
+        sleep 3
+        systemctl --user is-active --quiet "$UNIT"
+        return $?
+    fi
+    local tries="${DSHCTL_HEALTH_TRIES:-30}"
+    for i in $(seq 1 "$tries"); do
+        if systemctl --user is-active --quiet "$UNIT"; then
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$URL/" 2>/dev/null || true)
+            case "$code" in
+                ""|000|404|5*) : ;;
+                *) return 0 ;;
+            esac
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+restart_service() {
+    if ! spinner "重启中" -- systemctl --user restart "$UNIT"; then
+        echo "⚠ 服务重启失败，查看日志：dshctl log" >&2
+        return 1
+    fi
+    if wait_healthy; then
+        echo "✓ 服务已重启并运行：$URL"
+        return 0
+    fi
+    echo "⚠ 服务重启后未给出应用级应答（可能起来又崩），查看日志：dshctl log" >&2
+    return 1
+}
+
+# ── 预检：目标槽位能不能用当前 profile 启动 ──────────────────────────────
+# 槽位里那份 dsh 是否认识当前 profile 的配置段，只有真正加载一次插件树才知道
+# （官方包的 token-meter 没有 cost 段，切过去后服务直接起不来）。所以切换前先
+# 在临时 DSH_HOME + 空闲端口上试启一次：失败就拒绝切换，线上服务一动不动。
+PREFLIGHT_TRIES="${DSHCTL_PREFLIGHT_TRIES:-25}"
+
+# 目标槽位在指定端口上的启动命令行，和线上那条同源：官方槽位用 unit 原本的 ExecStart
+# （只换端口、加 --no-open），本地槽位用 service_bind_local 写的 node + flags + 槽位入口。
+registry_cmd() {
+    local port="$1" args
+    args=$(unit_arguments) || return 1
+    printf '%s %s --no-open' "$(unit_bin)" "$(printf '%s' "$args" | sed -E "s/--port [0-9]+/--port $port/")"
+}
+local_cmd() {
+    local port="$1" node entry
+    node=$(command -v node 2>/dev/null || true)
+    entry=$(readlink -f "$LOCAL_SLOT/bin/dsh" 2>/dev/null || true)
+    if [ -z "$node" ] || [ -z "$entry" ] || [ ! -f "$entry" ]; then
+        return 1
+    fi
+    printf '%s %s %s web --host 127.0.0.1 --port %s --no-open' "$node" "$LOCAL_NODE_FLAGS" "$entry" "$port"
+}
+
+# 试启用端口；只用 bash 的 /dev/tcp 探测，不依赖 ss / netstat。
+preflight_free_port() {
+    local port
+    for port in $(seq "${DSHCTL_PREFLIGHT_PORT:-3091}" 3120); do
+        if ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+            printf '%s' "$port"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 打印试启日志里最能说明问题的那几行。
+preflight_report() {
+    local log="$1" lines
+    [ -f "$log" ] || return 0
+    lines=$(grep -iE "error|invalid|unknown|failed" "$log" 2>/dev/null | tail -3)
+    [ -n "$lines" ] || lines=$(tail -3 "$log" 2>/dev/null)
+    [ -n "$lines" ] && printf '%s\n' "$lines" | sed 's/^/    /' >&2
+    return 0
+}
+
+# 收掉试启进程组与临时 home（web 会派生子进程，按进程组杀，避免留孤儿）。
+preflight_cleanup() {
+    local home="$1" pid="$2"
+    if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+        kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+        sleep 1
+        kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -rf "$home"
+    return 0
+}
+
+# 用当前 profile 试启目标槽位。返回 0 = 给出应用级应答；1 = 起不来（原因打到 stderr）。
+preflight_slot() {
+    local source="$1" home log port pid i code item
+    # 自测与应急的显式逃生门：关掉预检会有服务起不来的风险，因此跳过时照样出声。
+    if [ "${DSHCTL_PREFLIGHT:-1}" = "0" ]; then
+        echo "  预检已跳过（DSHCTL_PREFLIGHT=0）"
+        return 0
+    fi
+    home=$(mktemp -d "${TMPDIR:-/tmp}/dsh-preflight-XXXXXX") || return 1
+    # 只带启动判定需要的部分：插件树与 profile 才是判据，会话与附件不必进场。
+    for item in profiles settings.yaml AGENTS.md; do
+        [ -e "$HOME/.dsh/$item" ] && cp -a "$HOME/.dsh/$item" "$home/" 2>/dev/null
+    done
+    log="$home/preflight.log"
+    if ! port=$(preflight_free_port); then
+        echo "  预检：找不到空闲端口" >&2
+        preflight_cleanup "$home" ""
+        return 1
+    fi
+    # 命令行按空格切成 argv：这里的路径（node、槽位）都不含空格，与 dshctl 其余部分同假设。
+    local -a cmd=()
+    if ! read -r -a cmd <<< "$("${source}_cmd" "$port")" || [ "${#cmd[@]}" -lt 2 ]; then
+        echo "  预检：无法构造 $("${source}_label") 的启动命令" >&2
+        preflight_cleanup "$home" ""
+        return 1
+    fi
+    DSH_HOME="$home" setsid "${cmd[@]}" >"$log" 2>&1 &
+    pid=$!
+    for i in $(seq 1 "$PREFLIGHT_TRIES"); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "  预检失败：$("${source}_label") 启动即退出" >&2
+            preflight_report "$log"
+            preflight_cleanup "$home" "$pid"
+            return 1
+        fi
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$port/" 2>/dev/null || true)
+        case "$code" in
+            401|303|200)
+                # 应答之后再确认进程还活着：起一秒就崩的槽位会在这里现形（只看一次应答会误判）。
+                sleep 1
+                if kill -0 "$pid" 2>/dev/null; then
+                    echo "  预检通过：$("${source}_label") 能用当前 profile 启动"
+                    preflight_cleanup "$home" "$pid"
+                    return 0
+                fi
+                echo "  预检失败：$("${source}_label") 应答之后又退出了" >&2
+                preflight_report "$log"
+                preflight_cleanup "$home" "$pid"
+                return 1
+                ;;
+        esac
+        sleep 1
+    done
+    echo "  预检失败：$("${source}_label") 在 ${PREFLIGHT_TRIES}s 内没有给出应用级应答" >&2
+    preflight_report "$log"
+    preflight_cleanup "$home" "$pid"
+    return 1
+}
+
+# 只预检：dshctl check [official|local]（默认两个都试），不切换、不重启。
+check_slots() {
+    local want="${1:-}" source failed=0
+    local -a list=()
+    case "$want" in
+        "" )                           list=(registry local) ;;
+        official|registry|官方|官方包) list=(registry) ;;
+        local|本地|本地包)             list=(local) ;;
+        * ) echo "未知来源：$want（可用：official / local）" >&2; return 2 ;;
+    esac
+    echo "预检：用当前 profile 试启目标槽位（不切换、不重启）"
+    for source in "${list[@]}"; do
+        echo "── $("${source}_label") ──"
+        if ! "${source}_ready"; then
+            echo "  跳过：尚未安装"
+            failed=1
+            continue
+        fi
+        preflight_slot "$source" || failed=1
+    done
+    if [ "$failed" = "0" ]; then
+        echo "结论：槽位可用"
+    else
+        echo "结论：有槽位不可用——切过去服务会起不来，预检已拦下" >&2
+    fi
+    return "$failed"
+}
+
+# 只切换运行槽位（不重装）：dshctl use official | local。
+use_source() {
+    local want="${1:-}"
+    if [ -z "$want" ]; then
+        echo "当前运行来源：$("$(current_source)"_label)"
+        echo "可切换：official（官方包，全局槽位） / local（本地包，槽位 $LOCAL_SLOT）"
+        return 0
+    fi
+    case "$want" in
+        official|registry|官方|官方包) want=registry ;;
+        local|本地|本地包)             want=local ;;
+    esac
+    if ! source_known "$want"; then
+        echo "未知来源：$want（可用：official / local）" >&2
+        return 2
+    fi
+    if [ "$(current_source)" = "$want" ]; then
+        echo "当前已经是 $("${want}_label")，无需切换。"
+        return 0
+    fi
+    if ! "${want}_ready"; then
+        case "$want" in
+            local) echo "本地槽位还没装好，先执行：dshctl update --local <源码仓库 | tgz 目录>" >&2 ;;
+            *)     echo "官方包还没装好，先执行：dshctl update <通道>（如 dshctl update next）" >&2 ;;
+        esac
+        return 2
+    fi
+    local previous
+    previous=$(current_source)
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "── [dry-run] 会把运行来源切到 $("${want}_label")，然后重启服务 ──"
+        return 0
+    fi
+    echo "── 切换前预检 ──"
+    if ! preflight_slot "$want"; then
+        echo "预检未通过：$("${want}_label") 用当前 profile 起不来，保持 $("${previous}_label") 运行（未做任何切换）。" >&2
+        return 1
+    fi
+    if ! "${want}_bind"; then
+        return 1
+    fi
+    if [ "$RESTART" = "0" ]; then
+        echo "已切换为 $("${want}_label")（未重启，下次启动生效）"
+        return 0
+    fi
+    restart_checked "$previous"
+}
+
+# 展示当前运行来源、两个槽位与版本。
+show_source() {
+    local source detail
+    source=$(current_source)
+    echo "运行来源：$("${source}_label")"
+    echo "  服务入口：$(service_bin)"
+    if [ -f "$DROPIN" ]; then
+        echo "  切换文件：$DROPIN（存在 = 跑本地槽位）"
+    else
+        echo "  切换文件：无（跑官方槽位＝unit 原本的 ExecStart）"
+    fi
+    case "$source" in
+        registry)
+            echo "  通道：$(current_channel)"
+            echo "  槽位：$(global_root)"
+            ;;
+        local)
+            echo "  槽位：$LOCAL_SLOT"
+            echo "  构建来源：$(read_path_state "$LOCAL_PATH_FILE")"
+            detail=$(read_state "$LOCAL_DETAIL_FILE")
+            [ -n "$detail" ] && echo "  制品：$detail"
+            ;;
+    esac
+    echo "官方槽位版本：$(slot_version registry)"
+    echo "本地槽位版本：$(slot_version local)"
+    echo
+    echo "切换（不重装）：dshctl use local / dshctl use official"
+}
+
+# ── 交互菜单 ─────────────────────────────────────────────────────────────
+run_menu() {
+    menu() {
+        [ -t 0 ] && clear 2>/dev/null || true
+        echo "========================================="
+        echo "  dsh web 服务管理    $URL"
+        echo "========================================="
+        echo "  1) 更新 dsh（运行来源 $("$(current_source)"_label)，升级并按需切换）"
+        echo "  2) 查看运行状态"
+        echo "  3) 查看最近日志"
+        echo "  4) 重启服务"
+        echo "  5) 停止服务"
+        echo "  6) 启动服务"
+        echo "  7) 取消开机自启"
+        echo "  8) 查看完整说明（help）"
+        echo "  9) 切换更新通道并更新（latest/next/alpha）"
+        echo " 10) 从本地包安装/升级（源码仓库或 tgz 目录）"
+        echo " 11) 查看当前运行来源与两个槽位"
+        echo " 12) 只切换运行来源（官方包 ↔ 本地槽位）"
+        echo "  0) 退出"
+        echo "-----------------------------------------"
+        echo "  也可直接敲：dshctl update [--local 路径] / dshctl use local / dshctl source ..."
+        echo "========================================="
+        printf '  请选择 [0-9] 或 10/11/12: '
+    }
+    pause() {
+        echo
+        printf '按回车继续...'
+        read -r _ || true
+    }
+    while true; do
+        menu
+        read -r choice || { echo; break; }
+        echo
+        case "$choice" in
+            1) do_install "$(current_source)" "" ;;
+            2) systemctl --user --no-pager status "$UNIT" ;;
+            3) journalctl --user -u "$UNIT" -n 100 --no-pager ;;
+            4) systemctl --user restart "$UNIT" ;;
+            5) systemctl --user stop "$UNIT" ;;
+            6) systemctl --user start "$UNIT" ;;
+            7) systemctl --user disable "$UNIT" ;;
+            8) cat "$HELP" ;;
+            9) printf '  输入通道名（latest/next/alpha）: '
+               read -r tag || true
+               [ -n "${tag:-}" ] && do_install registry "$tag" ;;
+            10) printf '  输入本地路径（源码仓库 / 含 tgz 的目录 / 某个 .tgz；直接回车用记住的）: '
+                read -r local_path || true
+                do_install local "$local_path" ;;
+            11) show_source ;;
+            12) printf '  切到哪个？1) 官方包  2) 本地槽位 : '
+                read -r pick || true
+                case "${pick:-}" in
+                    1) use_source registry ;;
+                    2) use_source local ;;
+                    *) echo "  已取消" ;;
+                esac ;;
+            0) break ;;
+            *) echo "无效选择：$choice（请输入 0-9 或 10/11/12）" ;;
+        esac
+        pause
+    done
+}
+
+# ── 命令入口 ─────────────────────────────────────────────────────────────
+# ── 帮助 ─────────────────────────────────────────────────────────────────
+# 打印帮助。带子命令时先给该子命令的用法，再给完整说明；只输出，不产生任何副作用。
+show_usage() {
+    case "${1:-}" in
+        update|u)     echo "用法：dshctl update [通道|版本] [--local 路径] [--registry] [--dry-run] [--no-restart]" ;;
+        use|switch)   echo "用法：dshctl use official|local" ;;
+        check|verify) echo "用法：dshctl check [official|local]（只预检能否用当前 profile 启动，不切换、不重启）" ;;
+        "" )          ;;
+        *)            echo "用法：dshctl $1" ;;
+    esac
+    [ -f "$HELP" ] && cat "$HELP"
+    return 0
+}
+
+main() {
+    local arg
+    # 帮助优先：命令行里只要有 help / -h / --help，就只打印帮助，绝不执行子命令。
+    for arg in "$@"; do
+        case "$arg" in
+            help|-h|--help) show_usage "${1:-}"; return 0 ;;
+        esac
+    done
+    # 过程开关之外的「- 开头」参数都算不认识：宁可拒绝执行，也不当普通参数猜。
+    # 模式必须写死在 case 里：变量展开里的「|」是普通字符，不做备选。
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run|-n|--no-restart) ;;
+            --local|-l|--registry|-r)
+                case "${1:-}" in
+                    update|u) ;;
+                    *)
+                        echo "未知参数：$arg" >&2
+                        echo
+                        show_usage "${1:-}"
+                        return 2
+                        ;;
+                esac
+                ;;
+            -*)
+                echo "未知参数：$arg" >&2
+                echo
+                show_usage "${1:-}"
+                return 2
+                ;;
+        esac
+    done
+    # 再摘掉 --dry-run / --no-restart：它们只是过程开关，不该混进路径 / 通道参数里。
+    local -a args=()
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run|-n) DRY_RUN=1 ;;
+            --no-restart) RESTART=0 ;;
+            *) args+=("$arg") ;;
+        esac
+    done
+    set -- "${args[@]}"
+
+    case "${1:-}" in
+        "" )              run_menu ;;
+        update|u)
+            case "${2:-}" in
+                "" )           do_install "$(current_source)" "" ;;
+                --local|-l)    do_install local "${3:-}" ;;
+                --registry|-r) do_install registry "${3:-}" ;;
+                * )            do_install registry "$2" ;;
+            esac ;;
+        update-local|local|ul) do_install local "${2:-}" ;;
+        use|switch)       use_source "${2:-}" ;;
+        check|verify)     check_slots "${2:-}" ;;
+        source|src)       show_source ;;
+        status|s)         systemctl --user --no-pager status "$UNIT" ;;
+        log|l)            journalctl --user -u "$UNIT" -n 100 --no-pager ;;
+        restart|r)        systemctl --user restart "$UNIT" ;;
+        stop)             systemctl --user stop "$UNIT" ;;
+        start)            systemctl --user start "$UNIT" ;;
+        disable)          systemctl --user disable "$UNIT" ;;
+        help|h|-h|--help) cat "$HELP" ;;
+        * )
+            echo "未知命令：$1" >&2
+            echo
+            cat "$HELP"
+            return 1 ;;
+    esac
+}
+
+# 直接执行时跑 main；被 source（自测脚本）时只加载函数，不产生副作用。
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
