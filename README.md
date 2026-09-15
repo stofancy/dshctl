@@ -15,8 +15,8 @@ DeepSeek Harness (DSH) web 服务一站式管理工具。
 
 | 形态 | 适用场景 | 管理命令 |
 |------|---------|---------|
-| 官方槽位（npm 全局包） | 日常使用，跟随官方通道升级 | `dshctl update [latest/next/alpha]` |
-| 本地槽位（源码构建） | 开发调试 DSH 本身 | `dshctl update --local <路径>` |
+| 官方槽位（npm 全局包） | 日常使用，跟随官方通道升级 | `dshctl upgrade [latest/next/alpha]` |
+| 本地槽位（源码构建） | 开发调试 DSH 本身 | `dshctl upgrade --local <路径>` |
 | Docker 容器 | 不想装 node/systemd，或隔离部署 | `dshctl docker up` |
 
 前两种合称「双槽位架构」，可秒级互切；Docker 是独立的第三种部署形态（见下文 [Docker 部署](#docker-部署)）。
@@ -42,7 +42,7 @@ dshctl 实现了官方包和本地包的双槽位模型，两者互不覆盖，�
 如果您只是想使用稳定版本，**建议使用官方包**：
 ```bash
 # Linux/macOS
-dshctl update latest
+dshctl upgrade latest
 
 # Windows
 .\dshctl.ps1 update latest
@@ -58,7 +58,7 @@ dshctl update latest
 git clone https://github.com/deepseek-ai/dsh.git /path/to/dsh
 
 # Linux/macOS
-dshctl update --local /path/to/dsh
+dshctl upgrade --local /path/to/dsh
 
 # Windows
 .\dshctl.ps1 update -Local C:\path\to\dsh
@@ -104,29 +104,31 @@ dshctl update --local /path/to/dsh
 
 #### Linux/macOS
 
-1. 下载脚本：
+下载后跑一次 `install`，它会装 dshctl 到 `~/.local/bin`、生成 systemd 服务骨架（unit 的 ExecStart 自动指向 npm 全局 bin）、生成帮助文件：
 
 ```bash
-curl -o ~/.local/bin/dshctl https://raw.githubusercontent.com/stofancy/dshctl/main/dshctl
-chmod +x ~/.local/bin/dshctl
+curl -fsSL -o /tmp/dshctl https://raw.githubusercontent.com/stofancy/dshctl/main/dshctl
+chmod +x /tmp/dshctl
+/tmp/dshctl install            # 本机进程部署（systemd）
+/tmp/dshctl install --docker   # 或：docker 容器部署
 ```
 
-2. 确保 `~/.local/bin` 在 PATH 中：
+`install` 只搭骨架，不替你选版本；装完后执行 `dshctl upgrade`（装官方包并启动）或 `dshctl docker up`。
 
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
+`install` 做的事：
 
-3. 创建 systemd service 配置文件 `~/.config/systemd/user/dsh-web.service`：
+1. 复制自身到 `~/.local/bin/dshctl`（已在该位置则跳过），PATH 缺失时给出提示
+2. 生成帮助文件 `~/.config/dsh-web-help.txt`（已存在则跳过）
+3. 生成 systemd 用户 unit `~/.config/systemd/user/dsh-web.service`（已存在则跳过；`--docker` 时跳过），模板：
 
 ```ini
 [Unit]
-Description=DeepSeek Harness Web Service
-After=network.target
+Description=DeepSeek Harness Web (dsh)
+After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/path/to/dsh web --host 127.0.0.1 --port 3080
+ExecStart=<npm 全局前缀>/bin/dsh web --host 127.0.0.1 --port 3080
 Restart=on-failure
 RestartSec=5s
 
@@ -134,37 +136,17 @@ RestartSec=5s
 WantedBy=default.target
 ```
 
-4. 创建帮助文件 `~/.config/dsh-web-help.txt`（可选）：
-
-```text
-dshctl - DeepSeek Harness web 服务管理工具
-
-常用命令：
-  dshctl update           升级当前运行来源
-  dshctl status           查看服务状态
-  dshctl restart          重启服务
-  dshctl log              查看最近日志
-  dshctl source           查看当前运行来源与槽位信息
-  dshctl use <来源>       切换运行来源（official/local）
-  dshctl check            预检槽位是否可用
-  dshctl help             显示帮助信息
-
-无参数运行时进入交互菜单。
-```
-
 #### Windows
 
-1. 下载脚本：
+1. 下载脚本并初始化：
 
 ```powershell
-# 使用 PowerShell
 $url = "https://raw.githubusercontent.com/stofancy/dshctl/main/dshctl.ps1"
-$output = "$env:USERPROFILE\.local\bin\dshctl.ps1"
-New-Item -ItemType Directory -Force -Path (Split-Path $output) | Out-Null
-Invoke-WebRequest -Uri $url -OutFile $output
+$tmp = "$env:TEMP\dshctl.ps1"
+Invoke-WebRequest -Uri $url -OutFile $tmp
+& $tmp install            # 装到 ~\.local\bin\dshctl.ps1 并初始化状态目录
+& $tmp install --docker   # 或：docker 容器部署
 ```
-
-或者直接从 GitHub 下载后放到合适的位置。
 
 2. （可选）添加到 PATH 或创建别名：
 
@@ -172,8 +154,7 @@ Invoke-WebRequest -Uri $url -OutFile $output
 # 在 PowerShell profile 中添加别名
 Set-Alias -Name dshctl -Value "$env:USERPROFILE\.local\bin\dshctl.ps1"
 
-# 或者添加目录到 PATH
-$env:PATH += ";$env:USERPROFILE\.local\bin"
+# 或者把目录加入 PATH（系统设置 → 环境变量）
 ```
 
 3. 执行策略（首次运行可能需要）：
@@ -203,55 +184,70 @@ Windows 版本无交互菜单，直接运行会显示服务状态：
 
 ### 命令行模式
 
-#### 更新管理
+> **v0.4 起命令语义**：`update` 只负责更新 dshctl 自身，升级 dsh 用 `upgrade`（旧写法 `update latest` 仍可用，会提示迁移并转发）。首次使用先跑 `install`。
 
 **Linux/macOS:**
 ```bash
-# 升级当前运行来源（沿用记忆的通道）
-dshctl update
+# 首次安装：装 dshctl 到 ~/.local/bin + systemd 服务骨架 + 帮助文件
+dshctl install
+dshctl install --docker    # docker 部署形态，跳过 systemd
+
+# 升级当前槽位的 dsh（沿用记忆的通道）
+dshctl upgrade
 
 # 从指定通道安装官方包
-dshctl update latest
-dshctl update next
-dshctl update alpha
-dshctl update 0.1.5-rc.2
+dshctl upgrade latest
+dshctl upgrade next
+dshctl upgrade alpha
+dshctl upgrade 0.1.5-rc.2
 
 # 从本地源码仓库构建并安装（未指定路径会提示克隆）
-dshctl update --local
-dshctl update --local /path/to/dsh-repo
+dshctl upgrade --local
+dshctl upgrade --local /path/to/dsh-repo
 
 # 从已打包的 tarball 目录安装
-dshctl update --local /path/to/artifacts
+dshctl upgrade --local /path/to/artifacts
 
 # 从单个 tarball 安装
-dshctl update --local /path/to/package.tgz
+dshctl upgrade --local /path/to/package.tgz
 
 # 预演模式（只显示将要执行的操作，不实际安装）
-dshctl update --dry-run
+dshctl upgrade --dry-run
 
 # 安装但不重启服务
-dshctl update --no-restart
+dshctl upgrade --no-restart
+
+# 更新 dshctl 自身（对比 GitHub 上的 VERSION，校验后原子替换）
+dshctl update
+dshctl update --dry-run    # 只看有没有新版本
 ```
 
 **Windows:**
 ```powershell
-# 升级当前运行来源
-.\dshctl.ps1 update
+# 首次安装：装 dshctl.ps1 到 ~\.local\bin + 初始化状态目录
+.\dshctl.ps1 install
+.\dshctl.ps1 install --docker    # docker 部署形态
+
+# 升级当前槽位的 dsh
+.\dshctl.ps1 upgrade
 
 # 从指定通道安装官方包
-.\dshctl.ps1 update latest
-.\dshctl.ps1 update next
-.\dshctl.ps1 update 0.1.5-rc.2
+.\dshctl.ps1 upgrade latest
+.\dshctl.ps1 upgrade next
+.\dshctl.ps1 upgrade 0.1.5-rc.2
 
 # 从本地源码构建并安装（未指定路径会提示克隆）
-.\dshctl.ps1 update -Local
-.\dshctl.ps1 update -Local C:\path\to\dsh-repo
+.\dshctl.ps1 upgrade -Local
+.\dshctl.ps1 upgrade -Local C:\path\to\dsh-repo
 
 # 预演模式
-.\dshctl.ps1 update -DryRun
+.\dshctl.ps1 upgrade -DryRun
 
 # 安装但不重启服务
-.\dshctl.ps1 update -NoRestart
+.\dshctl.ps1 upgrade -NoRestart
+
+# 更新 dshctl 自身
+.\dshctl.ps1 update
 ```
 
 #### 槽位切换
@@ -465,6 +461,12 @@ dshctl docker down     # 停止并移除容器（数据卷保留）
 
 ## 开发
 
+### 版本与发布约定
+
+- dshctl 自身的版本号写在两处：仓库根 `VERSION` 文件、`dshctl` 里的 `DSHCTL_VERSION` 常量（PowerShell 版为 `dshctl.ps1` 里的 `$DSHCTL_VERSION`）。**发版时两处必须同步改**。
+- `dshctl update` 自更新依赖这两处的一致性做校验：远端 `VERSION` 宣称的版本号必须与下载脚本内的常量一致，否则拒绝替换——半截文件或错误页都换不坏正在用的 dshctl。
+- 命令语义自 v0.4 起：`update` = 更新 dshctl 自身，`upgrade` = 升级槽位 dsh（旧写法 `update <通道>` 兼容转发）。
+
 ### 代码架构
 
 dshctl 采用契约式设计，每个安装来源实现七个函数：
@@ -484,7 +486,7 @@ dshctl 采用契约式设计，每个安装来源实现七个函数：
 
 ```bash
 # 预演模式测试（不实际执行）
-dshctl update --dry-run
+dshctl upgrade --dry-run
 dshctl use local --dry-run
 
 # 禁用预检（应急使用，有风险）
