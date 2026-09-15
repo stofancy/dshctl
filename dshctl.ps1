@@ -11,14 +11,14 @@
     支持双槽位架构：官方包和本地包可随时切换。
 
 .PARAMETER Command
-    要执行的命令：update, status, start, stop, restart, log, source, use, check, help
+    要执行的命令：update, upgrade, install, status, start, stop, restart, log, source, use, check, help
 
 .EXAMPLE
-    .\dshctl.ps1 update
+    .已更新
     更新当前运行来源
 
 .EXAMPLE
-    .\dshctl.ps1 update -Local C:\path\to\dsh-repo
+    .\dshctl.ps1 upgrade -Local C:\path\to\dsh-repo
     从本地源码构建并安装
 
 .EXAMPLE
@@ -42,32 +42,37 @@ param(
 )
 
 # ── 常量配置 ────────────────────────────────────────────────────────────
-$script:PACKAGE_NAME = "@deepseek-ai/dsh"
-$script:SERVICE_NAME = "dsh-web"
-$script:DEFAULT_PORT = 3080
-$script:DEFAULT_HOST = "127.0.0.1"
-$script:URL = "http://${DEFAULT_HOST}:${DEFAULT_PORT}"
+$PACKAGE_NAME = "@deepseek-ai/dsh"
+$SERVICE_NAME = "dsh-web"
+$DEFAULT_PORT = 3080
+$DEFAULT_HOST = "127.0.0.1"
+$URL = "http://${DEFAULT_HOST}:${DEFAULT_PORT}"
+
+# dshctl 自身版本与远端基址：update 自更新时对比仓库根的 VERSION 文件。
+# 发版约定：改这里的同时改仓库根 VERSION，两处一致才放行。
+$DSHCTL_VERSION = "0.4.0"
+$DSHCTL_RAW_BASE = "https://raw.githubusercontent.com/stofancy/dshctl/main"
 
 # 状态目录
-$script:STATE_DIR = Join-Path $env:USERPROFILE ".config\dsh"
-$script:CHANNEL_FILE = Join-Path $STATE_DIR "channel"
-$script:LOCAL_PATH_FILE = Join-Path $STATE_DIR "local-path"
-$script:LOCAL_DETAIL_FILE = Join-Path $STATE_DIR "local-detail"
-$script:CURRENT_SOURCE_FILE = Join-Path $STATE_DIR "current-source"
+$STATE_DIR = Join-Path $env:USERPROFILE ".config\dsh"
+$CHANNEL_FILE = Join-Path $STATE_DIR "channel"
+$LOCAL_PATH_FILE = Join-Path $STATE_DIR "local-path"
+$LOCAL_DETAIL_FILE = Join-Path $STATE_DIR "local-detail"
+$CURRENT_SOURCE_FILE = Join-Path $STATE_DIR "current-source"
 
 # 本地打包输出目录
-$script:LOCAL_PACK_DIR = if ($env:DSHCTL_PACK_DIR) { 
+$LOCAL_PACK_DIR = if ($env:DSHCTL_PACK_DIR) { 
     $env:DSHCTL_PACK_DIR 
 } else { 
     Join-Path $env:USERPROFILE ".cache\dshctl\pack" 
 }
 
 # DSH 源码仓库
-$script:DSH_REPO_URL = "https://github.com/deepseek-ai/dsh.git"
-$script:DSH_DEFAULT_CLONE_DIR = Join-Path $env:USERPROFILE ".cache\dshctl\dsh-repo"
+$DSH_REPO_URL = "https://github.com/deepseek-ai/dsh.git"
+$DSH_DEFAULT_CLONE_DIR = Join-Path $env:USERPROFILE ".cache\dshctl\dsh-repo"
 
 # 本地槽位
-$script:LOCAL_SLOT = if ($env:DSHCTL_SLOT_DIR) { 
+$LOCAL_SLOT = if ($env:DSHCTL_SLOT_DIR) { 
     $env:DSHCTL_SLOT_DIR 
 } else { 
     Join-Path $env:USERPROFILE ".local\share\dshctl\slot-local" 
@@ -75,14 +80,14 @@ $script:LOCAL_SLOT = if ($env:DSHCTL_SLOT_DIR) {
 
 # Docker 部署模式：默认社区镜像 smanx/deepseek-harness（内置反代解决局域网访问），
 # DSHCTL_DOCKER_IMAGE 可换其他镜像。
-$script:DOCKER_IMAGE = if ($env:DSHCTL_DOCKER_IMAGE) { $env:DSHCTL_DOCKER_IMAGE } else { "smanx/deepseek-harness:latest" }
-$script:DOCKER_CONTAINER = "dshctl-dsh-web"
-$script:DOCKER_DATA_VOLUME = "dshctl-dsh-data"
-$script:DOCKER_INSTALL_VOLUME = "dshctl-dsh-install"   # 仅 admin 变体镜像需要
-$script:DOCKER_PORT = if ($env:DSHCTL_DOCKER_PORT) { [int]$env:DSHCTL_DOCKER_PORT } else { 3080 }
+$DOCKER_IMAGE = if ($env:DSHCTL_DOCKER_IMAGE) { $env:DSHCTL_DOCKER_IMAGE } else { "smanx/deepseek-harness:latest" }
+$DOCKER_CONTAINER = "dshctl-dsh-web"
+$DOCKER_DATA_VOLUME = "dshctl-dsh-data"
+$DOCKER_INSTALL_VOLUME = "dshctl-dsh-install"   # 仅 admin 变体镜像需要
+$DOCKER_PORT = if ($env:DSHCTL_DOCKER_PORT) { [int]$env:DSHCTL_DOCKER_PORT } else { 3080 }
 
 # 进程标识文件
-$script:PID_FILE = Join-Path $STATE_DIR "dsh-web.pid"
+$PID_FILE = Join-Path $STATE_DIR "dsh-web.pid"
 
 # ── 工具函数 ────────────────────────────────────────────────────────────
 
@@ -150,7 +155,7 @@ function Test-ValidChannel {
 
 # 获取当前通道
 function Get-CurrentChannel {
-    $channel = Read-State $script:CHANNEL_FILE
+    $channel = Read-State $CHANNEL_FILE
     if ($channel -and (Test-ValidChannel $channel)) {
         return $channel
     }
@@ -162,7 +167,7 @@ function Get-CurrentChannel {
 
 # 获取当前运行来源
 function Get-CurrentSource {
-    $source = Read-State $script:CURRENT_SOURCE_FILE
+    $source = Read-State $CURRENT_SOURCE_FILE
     if ($source -in @("registry", "local")) {
         return $source
     }
@@ -172,7 +177,7 @@ function Get-CurrentSource {
 # 设置当前运行来源
 function Set-CurrentSource {
     param([string]$Source)
-    Write-State $script:CURRENT_SOURCE_FILE $Source
+    Write-State $CURRENT_SOURCE_FILE $Source
 }
 
 # 获取已安装版本
@@ -196,7 +201,7 @@ function Get-ServiceBin {
     param([string]$Source = (Get-CurrentSource))
     
     if ($Source -eq "local") {
-        return Join-Path $script:LOCAL_SLOT "bin\dsh"
+        return Join-Path $LOCAL_SLOT "bin\dsh"
     } else {
         # 官方槽位：全局 npm
         try {
@@ -251,12 +256,12 @@ function Invoke-PromptCloneDsh {
     Write-Host ""
     Write-Host "本地槽位用于从源码构建 DSH，需要完整的源码仓库。"
     Write-Host "如果您只是想使用稳定版本，建议使用官方包："
-    Write-Host "  .\dshctl.ps1 update latest" -ForegroundColor Cyan
+    Write-Host "  .\dshctl.ps1 upgrade latest" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "是否自动克隆 DSH 源码仓库到："
-    Write-Host "  $($script:DSH_DEFAULT_CLONE_DIR)" -ForegroundColor Cyan
+    Write-Host "  $($DSH_DEFAULT_CLONE_DIR)" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "仓库地址：$($script:DSH_REPO_URL)"
+    Write-Host "仓库地址：$($DSH_REPO_URL)"
     Write-Host "克隆大小：约 100MB，首次构建需要数分钟"
     Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Yellow
     Write-Host ""
@@ -267,7 +272,7 @@ function Invoke-PromptCloneDsh {
 
 # 克隆 DSH 仓库
 function Invoke-CloneDshRepo {
-    $target = $script:DSH_DEFAULT_CLONE_DIR
+    $target = $DSH_DEFAULT_CLONE_DIR
     
     if (Test-Path $target) {
         Write-Info "目标目录已存在：$target"
@@ -288,7 +293,7 @@ function Invoke-CloneDshRepo {
     }
     
     Write-Info "开始克隆 DSH 源码仓库..."
-    Write-Info "仓库：$($script:DSH_REPO_URL)"
+    Write-Info "仓库：$($DSH_REPO_URL)"
     Write-Info "目标：$target"
     
     if (-not (Test-Command "git")) {
@@ -302,7 +307,7 @@ function Invoke-CloneDshRepo {
     }
     
     try {
-        git clone --depth 1 $script:DSH_REPO_URL $target 2>&1 | Out-Null
+        git clone --depth 1 $DSH_REPO_URL $target 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) {
             Write-Success "克隆完成：$target"
             return $target
@@ -353,19 +358,19 @@ function Test-DockerAuthValid {
     return $true
 }
 
-# 用指定镜像（tag 或镜像 ID）启动容器。挂载配置始终由 $script:DOCKER_IMAGE 判断，
+# 用指定镜像（tag 或镜像 ID）启动容器。挂载配置始终由 $DOCKER_IMAGE 判断，
 # 与传入镜像解耦——update 回退用旧镜像 ID 重建时挂载保持原样。
 function Start-DockerContainer {
     param([string]$Image)
     
     $runArgs = @(
-        "run", "-d", "--name", $script:DOCKER_CONTAINER,
+        "run", "-d", "--name", $DOCKER_CONTAINER,
         "--restart", "unless-stopped",
-        "-p", "$($script:DOCKER_PORT):3080",
-        "-v", "$($script:DOCKER_DATA_VOLUME):/root/.dsh"
+        "-p", "$($DOCKER_PORT):3080",
+        "-v", "$($DOCKER_DATA_VOLUME):/root/.dsh"
     )
-    if ($script:DOCKER_IMAGE -match 'admin') {
-        $runArgs += @("-v", "$($script:DOCKER_INSTALL_VOLUME):/opt/dsh")
+    if ($DOCKER_IMAGE -match 'admin') {
+        $runArgs += @("-v", "$($DOCKER_INSTALL_VOLUME):/opt/dsh")
     }
     if (-not [string]::IsNullOrEmpty($env:DSHCTL_DOCKER_AUTH_USER)) {
         $runArgs += @("-e", "PROXY_USERNAME=$($env:DSHCTL_DOCKER_AUTH_USER)",
@@ -379,13 +384,13 @@ function Start-DockerContainer {
 
 # 容器是否存在
 function Test-DockerContainerExists {
-    docker container inspect $script:DOCKER_CONTAINER 2>$null | Out-Null
+    docker container inspect $DOCKER_CONTAINER 2>$null | Out-Null
     return ($LASTEXITCODE -eq 0)
 }
 
 # 容器是否在运行
 function Test-DockerContainerRunning {
-    $state = docker container inspect -f '{{.State.Status}}' $script:DOCKER_CONTAINER 2>$null
+    $state = docker container inspect -f '{{.State.Status}}' $DOCKER_CONTAINER 2>$null
     return ($state -eq "running")
 }
 
@@ -393,30 +398,30 @@ function Start-DshDocker {
     if (-not (Test-DockerAuthValid)) { return $false }
     
     if (Test-DockerContainerRunning) {
-        Write-Warning "容器已在运行：$($script:DOCKER_CONTAINER)"
+        Write-Warning "容器已在运行：$($DOCKER_CONTAINER)"
         Get-DshDockerStatus
         return $true
     }
     
-    Write-Info "镜像：$($script:DOCKER_IMAGE)"
-    Write-Info "端口：$($script:DOCKER_PORT)（宿主）→ 3080（容器内代理）"
-    Write-Info "数据：卷 $($script:DOCKER_DATA_VOLUME) → /root/.dsh"
+    Write-Info "镜像：$($DOCKER_IMAGE)"
+    Write-Info "端口：$($DOCKER_PORT)（宿主）→ 3080（容器内代理）"
+    Write-Info "数据：卷 $($DOCKER_DATA_VOLUME) → /root/.dsh"
     
     Write-Info "拉取镜像..."
-    docker pull $script:DOCKER_IMAGE 2>&1 | Out-Null
+    docker pull $DOCKER_IMAGE 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Error "镜像拉取失败"
         return $false
     }
     
     Write-Info "启动容器..."
-    if (-not (Start-DockerContainer $script:DOCKER_IMAGE)) {
-        Write-Error "容器启动失败；若是端口占用，先停掉本机其他占用 $($script:DOCKER_PORT) 的服务"
+    if (-not (Start-DockerContainer $DOCKER_IMAGE)) {
+        Write-Error "容器启动失败；若是端口占用，先停掉本机其他占用 $($DOCKER_PORT) 的服务"
         return $false
     }
     
     if (Test-ServiceHealth) {
-        Write-Success "服务已就绪：$($script:URL)"
+        Write-Success "服务已就绪：$($URL)"
         return $true
     }
     Write-Error "容器已启动但健康检查未通过，查看日志：.\dshctl.ps1 docker log"
@@ -425,16 +430,16 @@ function Start-DshDocker {
 
 function Stop-DshDocker {
     if (-not (Test-DockerContainerExists)) {
-        Write-Warning "容器不存在：$($script:DOCKER_CONTAINER)"
+        Write-Warning "容器不存在：$($DOCKER_CONTAINER)"
         return $true
     }
     Write-Info "停止并移除容器..."
-    docker rm -f $script:DOCKER_CONTAINER 2>&1 | Out-Null
+    docker rm -f $DOCKER_CONTAINER 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Error "容器移除失败"
         return $false
     }
-    Write-Success "已停止（数据卷 $($script:DOCKER_DATA_VOLUME) 保留，会话与配置不丢）"
+    Write-Success "已停止（数据卷 $($DOCKER_DATA_VOLUME) 保留，会话与配置不丢）"
     return $true
 }
 
@@ -444,13 +449,13 @@ function Restart-DshDocker {
         return $false
     }
     Write-Info "重启容器..."
-    docker restart $script:DOCKER_CONTAINER 2>&1 | Out-Null
+    docker restart $DOCKER_CONTAINER 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Error "重启失败"
         return $false
     }
     if (Test-ServiceHealth) {
-        Write-Success "服务已就绪：$($script:URL)"
+        Write-Success "服务已就绪：$($URL)"
         return $true
     }
     Write-Error "重启后健康检查未通过，查看日志：.\dshctl.ps1 docker log"
@@ -462,16 +467,16 @@ function Get-DshDockerStatus {
         Write-Warning "容器未创建（docker 模式未部署）。启动：.\dshctl.ps1 docker up"
         return $false
     }
-    docker ps -a --filter "name=^$($script:DOCKER_CONTAINER)$" `
+    docker ps -a --filter "name=^$($DOCKER_CONTAINER)$" `
         --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
     try {
-        $response = Invoke-WebRequest -Uri "$($script:URL)/" -Method Head -TimeoutSec 3 -ErrorAction Stop
-        Write-Host "应用应答：HTTP $($response.StatusCode)（$($script:URL)）"
+        $response = Invoke-WebRequest -Uri "$($URL)/" -Method Head -TimeoutSec 3 -ErrorAction Stop
+        Write-Host "应用应答：HTTP $($response.StatusCode)（$($URL)）"
     } catch {
         $code = 0
         if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
         if ($code -gt 0) {
-            Write-Host "应用应答：HTTP $code（$($script:URL)）"
+            Write-Host "应用应答：HTTP $code（$($URL)）"
         } else {
             Write-Host "应用应答：无（服务未就绪）"
         }
@@ -481,10 +486,10 @@ function Get-DshDockerStatus {
 
 function Show-DshDockerLog {
     if (-not (Test-DockerContainerExists) ) {
-        Write-Error "容器不存在：$($script:DOCKER_CONTAINER)"
+        Write-Error "容器不存在：$($DOCKER_CONTAINER)"
         return $false
     }
-    docker logs --tail 100 $script:DOCKER_CONTAINER
+    docker logs --tail 100 $DOCKER_CONTAINER
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -494,46 +499,46 @@ function Update-DshDocker {
     
     $oldImage = ""
     if (Test-DockerContainerExists) {
-        $oldImage = (docker container inspect -f '{{.Image}}' $script:DOCKER_CONTAINER 2>$null)
+        $oldImage = (docker container inspect -f '{{.Image}}' $DOCKER_CONTAINER 2>$null)
     }
     
     Write-Info "拉取最新镜像..."
-    docker pull $script:DOCKER_IMAGE 2>&1 | Out-Null
+    docker pull $DOCKER_IMAGE 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Error "镜像拉取失败"
         return $false
     }
     
-    $newImage = (docker image inspect -f '{{.Id}}' $script:DOCKER_IMAGE 2>$null)
+    $newImage = (docker image inspect -f '{{.Id}}' $DOCKER_IMAGE 2>$null)
     if (-not $newImage) {
-        Write-Error "读不到镜像 ID：$($script:DOCKER_IMAGE)"
+        Write-Error "读不到镜像 ID：$($DOCKER_IMAGE)"
         return $false
     }
     
     if ($oldImage -eq $newImage) {
-        Write-Success "镜像已是最新：$($script:DOCKER_IMAGE)"
+        Write-Success "镜像已是最新：$($DOCKER_IMAGE)"
         return $true
     }
     
-    if ($script:DryRun) {
+    if ($DryRun) {
         Write-Warning "[DRY RUN] 会用新镜像重建容器并重启"
         return $true
     }
     
     Write-Info "镜像有更新，重建容器（数据卷保留）..."
-    docker rm -f $script:DOCKER_CONTAINER 2>&1 | Out-Null
+    docker rm -f $DOCKER_CONTAINER 2>&1 | Out-Null
     
-    if ((Start-DockerContainer $script:DOCKER_IMAGE) -and (Test-ServiceHealth)) {
-        Write-Success "已更新并就绪：$($script:URL)"
+    if ((Start-DockerContainer $DOCKER_IMAGE) -and (Test-ServiceHealth)) {
+        Write-Success "已更新并就绪：$($URL)"
         return $true
     }
     
     Write-Warning "新容器未就绪，回退到上一镜像..."
-    docker rm -f $script:DOCKER_CONTAINER 2>&1 | Out-Null
+    docker rm -f $DOCKER_CONTAINER 2>&1 | Out-Null
     if ($oldImage -and (Start-DockerContainer $oldImage) -and (Test-ServiceHealth)) {
-        Write-Warning "已回退到旧镜像，服务恢复运行；新镜像问题可看：docker logs $($script:DOCKER_CONTAINER)"
+        Write-Warning "已回退到旧镜像，服务恢复运行；新镜像问题可看：docker logs $($DOCKER_CONTAINER)"
     } else {
-        Write-Error "回退也失败了，手动排查：docker pull $($script:DOCKER_IMAGE) 后 .\dshctl.ps1 docker up"
+        Write-Error "回退也失败了，手动排查：docker pull $($DOCKER_IMAGE) 后 .\dshctl.ps1 docker up"
     }
     return $false
 }
@@ -544,7 +549,7 @@ function Invoke-Docker {
     
     if (-not (Test-DockerAvailable)) { return }
     # docker 模式按实际对外端口做健康检查
-    $script:URL = "http://127.0.0.1:$($script:DOCKER_PORT)"
+    $URL = "http://127.0.0.1:$($DOCKER_PORT)"
     
     switch ($Action) {
         "up"      { Start-DshDocker }
@@ -555,8 +560,8 @@ function Invoke-Docker {
         "update"  { Update-DshDocker }
         "" {
             Write-Host "用法：.\dshctl.ps1 docker up|down|restart|status|log|update"
-            Write-Host "  镜像：$($script:DOCKER_IMAGE)（DSHCTL_DOCKER_IMAGE 可覆盖）"
-            Write-Host "  端口：$($script:DOCKER_PORT) → 容器 3080（DSHCTL_DOCKER_PORT 可覆盖）"
+            Write-Host "  镜像：$($DOCKER_IMAGE)（DSHCTL_DOCKER_IMAGE 可覆盖）"
+            Write-Host "  端口：$($DOCKER_PORT) → 容器 3080（DSHCTL_DOCKER_PORT 可覆盖）"
         }
         default {
             Write-Error "未知 docker 子命令：$Action"
@@ -569,7 +574,7 @@ function Invoke-Docker {
 
 # 获取服务进程
 function Get-DshProcess {
-    $pidFile = $script:PID_FILE
+    $pidFile = $PID_FILE
     if (Test-Path $pidFile) {
         $pid = [int](Get-Content $pidFile -Raw).Trim()
         try {
@@ -586,7 +591,7 @@ function Get-DshProcess {
     
     # 尝试通过端口查找进程
     try {
-        $connection = Get-NetTCPConnection -LocalPort $script:DEFAULT_PORT -ErrorAction Stop | Select-Object -First 1
+        $connection = Get-NetTCPConnection -LocalPort $DEFAULT_PORT -ErrorAction Stop | Select-Object -First 1
         if ($connection) {
             return Get-Process -Id $connection.OwningProcess -ErrorAction Stop
         }
@@ -613,7 +618,7 @@ function Start-DshService {
     Write-Info "启动服务..."
     
     try {
-        $logDir = Join-Path $script:STATE_DIR "logs"
+        $logDir = Join-Path $STATE_DIR "logs"
         if (-not (Test-Path $logDir)) {
             New-Item -ItemType Directory -Path $logDir -Force | Out-Null
         }
@@ -624,7 +629,7 @@ function Start-DshService {
         # 启动进程
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = "node"
-        $psi.Arguments = "`"$bin`" web --host $($script:DEFAULT_HOST) --port $($script:DEFAULT_PORT)"
+        $psi.Arguments = "`"$bin`" web --host $($DEFAULT_HOST) --port $($DEFAULT_PORT)"
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
         $psi.UseShellExecute = $false
@@ -634,7 +639,7 @@ function Start-DshService {
         $process = [System.Diagnostics.Process]::Start($psi)
         
         # 保存 PID
-        $process.Id | Out-File -FilePath $script:PID_FILE -Encoding utf8 -NoNewline
+        $process.Id | Out-File -FilePath $PID_FILE -Encoding utf8 -NoNewline
         
         # 重定向输出到日志文件（后台任务）
         Start-Job -ScriptBlock {
@@ -647,7 +652,7 @@ function Start-DshService {
         Start-Sleep -Seconds 2
         
         if (Test-ServiceHealth) {
-            Write-Success "服务已启动：$($script:URL)"
+            Write-Success "服务已启动：$($URL)"
             return $true
         } else {
             Write-Error "服务启动后无法访问"
@@ -673,8 +678,8 @@ function Stop-DshService {
         $process.Kill()
         $process.WaitForExit(5000)
         
-        if (Test-Path $script:PID_FILE) {
-            Remove-Item $script:PID_FILE -Force
+        if (Test-Path $PID_FILE) {
+            Remove-Item $PID_FILE -Force
         }
         
         Write-Success "服务已停止"
@@ -699,7 +704,7 @@ function Test-ServiceHealth {
     
     for ($i = 1; $i -le $MaxRetries; $i++) {
         try {
-            $response = Invoke-WebRequest -Uri $script:URL -Method Head -TimeoutSec 3 -ErrorAction Stop
+            $response = Invoke-WebRequest -Uri $URL -Method Head -TimeoutSec 3 -ErrorAction Stop
             if ($response.StatusCode -in @(200, 401, 303)) {
                 return $true
             }
@@ -733,7 +738,7 @@ function Get-ServiceStatus {
         Write-ColorText "  状态：已停止" "Red"
     }
     
-    Write-Host "  访问地址：$($script:URL)"
+    Write-Host "  访问地址：$($URL)"
     Write-Host "  运行来源：$(if($source -eq 'local'){'本地包'}else{'官方包'})"
     Write-Host "  版本：$version"
     Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
@@ -752,13 +757,13 @@ function Install-RegistryPackage {
         return $false
     }
     
-    Write-Info "安装官方包 $($script:PACKAGE_NAME)@$Channel ..."
+    Write-Info "安装官方包 $($PACKAGE_NAME)@$Channel ..."
     
     try {
-        npm install -g "$($script:PACKAGE_NAME)@$Channel" --fetch-timeout=120000 --fetch-retries=3
+        npm install -g "$($PACKAGE_NAME)@$Channel" --fetch-timeout=120000 --fetch-retries=3
         if ($LASTEXITCODE -eq 0) {
             Write-Success "安装完成"
-            Write-State $script:CHANNEL_FILE $Channel
+            Write-State $CHANNEL_FILE $Channel
             Set-CurrentSource "registry"
             return $true
         } else {
@@ -778,7 +783,7 @@ function Install-LocalPackage {
     # 验证路径
     if (-not $Path) {
         # 尝试读取记忆的路径
-        $Path = Read-State $script:LOCAL_PATH_FILE
+        $Path = Read-State $LOCAL_PATH_FILE
     }
     
     if (-not $Path) {
@@ -788,13 +793,13 @@ function Install-LocalPackage {
             if (-not $Path) {
                 Write-Host ""
                 Write-Host "克隆失败。您也可以手动克隆后再试：" -ForegroundColor Yellow
-                Write-Host "  git clone $($script:DSH_REPO_URL) C:\path\to\dsh" -ForegroundColor Cyan
-                Write-Host "  .\dshctl.ps1 update -Local C:\path\to\dsh" -ForegroundColor Cyan
+                Write-Host "  git clone $($DSH_REPO_URL) C:\path\to\dsh" -ForegroundColor Cyan
+                Write-Host "  .\dshctl.ps1 upgrade -Local C:\path\to\dsh" -ForegroundColor Cyan
                 return $false
             }
         } else {
             Write-Host ""
-            Write-Host "已取消。建议使用官方包：.\dshctl.ps1 update latest" -ForegroundColor Yellow
+            Write-Host "已取消。建议使用官方包：.\dshctl.ps1 upgrade latest" -ForegroundColor Yellow
             return $false
         }
     }
@@ -834,8 +839,8 @@ function Install-LocalPackage {
                     throw "构建失败"
                 }
                 
-                $outVendor = Join-Path $script:LOCAL_PACK_DIR "vendor"
-                $outDsh = Join-Path $script:LOCAL_PACK_DIR "dsh"
+                $outVendor = Join-Path $LOCAL_PACK_DIR "vendor"
+                $outDsh = Join-Path $LOCAL_PACK_DIR "dsh"
                 
                 pnpm run release:pack --family vendor --out $outVendor
                 pnpm run release:pack --family dsh --out $outDsh
@@ -868,11 +873,11 @@ function Install-LocalPackage {
     
     try {
         $tarballPaths = $tarballs | ForEach-Object { $_.FullName }
-        npm install -g --prefix $script:LOCAL_SLOT --no-audit --no-fund $tarballPaths
+        npm install -g --prefix $LOCAL_SLOT --no-audit --no-fund $tarballPaths
         
         if ($LASTEXITCODE -eq 0) {
             Write-Success "安装完成"
-            Write-State $script:LOCAL_PATH_FILE $Path
+            Write-State $LOCAL_PATH_FILE $Path
             Set-CurrentSource "local"
             return $true
         } else {
@@ -885,37 +890,33 @@ function Install-LocalPackage {
     }
 }
 
-# 更新命令
-function Invoke-Update {
+# 升级槽位 dsh（v0.4 前叫 update）：upgrade [通道|版本] [-Local 路径] [-Registry]
+function Invoke-Upgrade {
     param(
         [string]$Target,
         [switch]$Local,
         [switch]$Registry
     )
-    
-    if ($script:DryRun) {
+
+    if ($DryRun) {
         Write-Warning "[DRY RUN] 预演模式，不会实际执行"
-    }
-    
-    $success = $false
-    
-    if ($Local) {
-        if (-not $script:DryRun) {
-            $success = Install-LocalPackage $Target
-        } else {
+        if ($Local) {
             Write-Info "将从本地路径安装：$(if($Target){$Target}else{'记忆的路径或自动克隆'})"
-            return $true
-        }
-    } elseif ($Registry -or $Target -match '^(latest|next|alpha|[0-9])') {
-        if (-not $script:DryRun) {
-            $channel = if ($Target) { $Target } else { Get-CurrentChannel }
-            $success = Install-RegistryPackage $channel
         } else {
-            Write-Info "将安装官方包：$($script:PACKAGE_NAME)@$(if($Target){$Target}else{Get-CurrentChannel})"
-            return $true
+            Write-Info "将安装官方包：$($PACKAGE_NAME)@$(if($Target){$Target}else{Get-CurrentChannel})"
         }
+        return $true
+    }
+
+    $success = $false
+
+    if ($Local) {
+        $success = Install-LocalPackage $Target
+    } elseif ($Registry -or $Target -match '^(latest|next|alpha|[0-9])') {
+        $channel = if ($Target) { $Target } else { Get-CurrentChannel }
+        $success = Install-RegistryPackage $channel
     } else {
-        # 默认：更新当前来源
+        # 默认：升级当前来源
         $currentSource = Get-CurrentSource
         if ($currentSource -eq "local") {
             $success = Install-LocalPackage
@@ -923,12 +924,107 @@ function Invoke-Update {
             $success = Install-RegistryPackage
         }
     }
-    
-    if ($success -and -not $script:NoRestart) {
+
+    if ($success -and -not $NoRestart) {
         Restart-DshService | Out-Null
     }
-    
+
     return $success
+}
+
+# 更新 dshctl 自身（不是 dsh）：对比远端 VERSION，下载新版并替换本文件。
+# 校验两道：语法必须解析通过、版本号必须与远端 VERSION 一致——下载失败或内容异常不动原文件。
+function Invoke-SelfUpdate {
+    $selfPath = $PSCommandPath
+    if (-not $selfPath) {
+        Write-Error "取不到自身路径，无法自更新"
+        return $false
+    }
+
+    $remote = ""
+    try {
+        $remote = (Invoke-RestMethod -Uri "$DSHCTL_RAW_BASE/VERSION" -TimeoutSec 20).ToString().Trim()
+    } catch {
+        Write-Error "取不到远端版本号（网络问题？），未做任何改动"
+        return $false
+    }
+    if ($remote -notmatch '^\d+\.\d+\.\d+$') {
+        Write-Error "远端版本号异常：$remote，未做任何改动"
+        return $false
+    }
+    if ($remote -eq $DSHCTL_VERSION) {
+        Write-Success "dshctl 已是最新（$DSHCTL_VERSION）"
+        return $true
+    }
+
+    Write-Info "发现新版本：$DSHCTL_VERSION → $remote"
+    if ($DryRun) {
+        Write-Warning "[DRY RUN] 只报版本不更新（去掉 -DryRun 才会真正执行）"
+        return $true
+    }
+
+    $tmp = [System.IO.Path]::GetTempFileName()
+    try {
+        Invoke-WebRequest -Uri "$DSHCTL_RAW_BASE/dshctl.ps1" -OutFile $tmp -TimeoutSec 60
+        # 语法校验：下载的必须是完整可解析的脚本
+        $tokens = $null; $parseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$tokens, [ref]$parseErrors) | Out-Null
+        if ($parseErrors.Count -gt 0) { throw "下载的脚本语法校验未通过" }
+        # 版本校验：内容里的版本号必须与远端 VERSION 宣称一致
+        $content = Get-Content $tmp -Raw
+        if ($content -notmatch ('\$DSHCTL_VERSION\s*=\s*"' + [regex]::Escape($remote) + '"')) {
+            throw "下载内容版本号与远端 VERSION 不一致"
+        }
+        Copy-Item -Path $tmp -Destination $selfPath -Force
+        Write-Success "dshctl 已更新到 $remote（当前进程仍是旧版，重新运行 dshctl 即生效）"
+        return $true
+    } catch {
+        Write-Error "更新失败：$_（未做任何改动）"
+        return $false
+    } finally {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 首次安装：.\dshctl.ps1 install [--docker]
+# 装 dshctl 自身到 ~\.local\bin、初始化状态目录；不替用户做版本决定
+# （装哪个 dsh 由 upgrade / docker up 完成）。
+function Invoke-InstallCmd {
+    param([string]$Mode)
+
+    if ($Mode -and $Mode -notin @("--docker", "-d")) {
+        Write-Error "用法：.\dshctl.ps1 install [--docker]"
+        return
+    }
+
+    $selfPath = $PSCommandPath
+    $binDir = Join-Path $env:USERPROFILE ".local\bin"
+
+    Write-Host "── [1/3] 安装 dshctl ──"
+    $onPath = (Get-Command dshctl -ErrorAction SilentlyContinue).Source
+    if ($onPath -and $onPath -eq $selfPath) {
+        Write-Success "已在 PATH：$selfPath"
+    } else {
+        New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+        Copy-Item -Path $selfPath -Destination (Join-Path $binDir "dshctl.ps1") -Force
+        Write-Success "已安装：$(Join-Path $binDir 'dshctl.ps1')"
+        if ($env:PATH -notlike "*$binDir*") {
+            Write-Warning "$binDir 不在 PATH；请在系统设置中加入，或用完整路径运行"
+        }
+    }
+
+    Write-Host "── [2/3] 状态目录与日志目录 ──"
+    New-Item -ItemType Directory -Path $STATE_DIR -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $STATE_DIR "logs") -Force | Out-Null
+    Write-Success "已就绪：$STATE_DIR"
+
+    Write-Host "── [3/3] 下一步 ──"
+    if ($Mode -in @("--docker", "-d")) {
+        Write-Host "  已选 docker 部署。启动容器：.\dshctl.ps1 docker up"
+    } else {
+        Write-Host "  方式一（本机进程）：.\dshctl.ps1 upgrade latest   # 安装官方包并启动"
+        Write-Host "  方式二（容器）　：.\dshctl.ps1 docker up"
+    }
 }
 
 # 切换来源
@@ -962,14 +1058,14 @@ function Invoke-UseSource {
     if ($version -eq "未安装") {
         Write-Error "目标槽位未安装"
         if ($targetSource -eq "local") {
-            Write-Host "先执行：.\dshctl.ps1 update -Local <路径>" -ForegroundColor Cyan
+            Write-Host "先执行：.\dshctl.ps1 upgrade -Local <路径>" -ForegroundColor Cyan
         } else {
-            Write-Host "先执行：.\dshctl.ps1 update latest" -ForegroundColor Cyan
+            Write-Host "先执行：.\dshctl.ps1 upgrade latest" -ForegroundColor Cyan
         }
         return
     }
     
-    if ($script:DryRun) {
+    if ($DryRun) {
         Write-Warning "[DRY RUN] 将切换到 $(if($targetSource -eq 'local'){'本地包'}else{'官方包'})"
         return
     }
@@ -977,7 +1073,7 @@ function Invoke-UseSource {
     Set-CurrentSource $targetSource
     Write-Success "已切换为 $(if($targetSource -eq 'local'){'本地包'}else{'官方包'})"
     
-    if (-not $script:NoRestart) {
+    if (-not $NoRestart) {
         Restart-DshService | Out-Null
     }
 }
@@ -998,7 +1094,7 @@ function Show-Source {
     if ($source -eq "registry") {
         Write-Host "  更新通道：$(Get-CurrentChannel)"
     } else {
-        $localPath = Read-State $script:LOCAL_PATH_FILE
+        $localPath = Read-State $LOCAL_PATH_FILE
         if ($localPath) {
             Write-Host "  构建来源：$localPath"
         }
@@ -1015,8 +1111,8 @@ function Show-Source {
 
 # 查看日志
 function Show-Log {
-    $logFile = Join-Path $script:STATE_DIR "logs\dsh-web.log"
-    $errFile = Join-Path $script:STATE_DIR "logs\dsh-web.err.log"
+    $logFile = Join-Path $STATE_DIR "logs\dsh-web.log"
+    $errFile = Join-Path $STATE_DIR "logs\dsh-web.err.log"
     
     Write-Host ""
     Write-Host "━━━ 标准输出 ━━━" -ForegroundColor Cyan
@@ -1046,8 +1142,10 @@ dshctl.ps1 - DeepSeek Harness web 服务管理工具 (Windows 版本)
   .\dshctl.ps1 <命令> [参数] [选项]
 
 常用命令：
-  update [通道/版本]      更新官方包（默认沿用记忆的通道）
-  update -Local [路径]    从本地源码/制品安装
+  update                  更新 dshctl 自身（v0.4 前的 update 语义改为 upgrade）
+  upgrade [通道/版本]     升级官方包 dsh（默认沿用记忆的通道）
+  upgrade -Local [路径]   从本地源码/制品升级
+  install [--docker]      首次安装：装 dshctl + 初始化
   status                  查看服务状态
   start                   启动服务
   stop                    停止服务
@@ -1059,14 +1157,14 @@ dshctl.ps1 - DeepSeek Harness web 服务管理工具 (Windows 版本)
   help                    显示帮助信息
 
 通道/版本示例：
-  .\dshctl.ps1 update latest
-  .\dshctl.ps1 update next
-  .\dshctl.ps1 update 0.1.5-rc.2
+  .\dshctl.ps1 upgrade latest
+  .\dshctl.ps1 upgrade next
+  .\dshctl.ps1 upgrade 0.1.5-rc.2
 
 本地安装示例：
-  .\dshctl.ps1 update -Local C:\path\to\dsh-repo
-  .\dshctl.ps1 update -Local C:\path\to\artifacts
-  .\dshctl.ps1 update -Local C:\path\to\package.tgz
+  .\dshctl.ps1 upgrade -Local C:\path\to\dsh-repo
+  .\dshctl.ps1 upgrade -Local C:\path\to\artifacts
+  .\dshctl.ps1 upgrade -Local C:\path\to\package.tgz
 
 选项：
   -DryRun        预演模式（不实际执行）
@@ -1075,8 +1173,8 @@ dshctl.ps1 - DeepSeek Harness web 服务管理工具 (Windows 版本)
 
 示例：
   .\dshctl.ps1 status
-  .\dshctl.ps1 update latest
-  .\dshctl.ps1 update -Local -DryRun
+  .\dshctl.ps1 upgrade latest
+  .\dshctl.ps1 upgrade -Local -DryRun
   .\dshctl.ps1 use local
   .\dshctl.ps1 restart
 
@@ -1099,7 +1197,20 @@ function Main {
             Get-ServiceStatus
         }
         { $_ -in @("update", "u") } {
-            Invoke-Update -Target $Target -Local:$Local -Registry:$Registry
+            # v0.4 起 update 只管 dshctl 自身；带目标参数的旧用法转发到 upgrade（提示迁移）。
+            if ($Target -or $Local -or $Registry) {
+                Write-Warning "v0.4 起 update 只更新 dshctl 自身；升级 dsh 请用 upgrade"
+                Write-Host "  本次已按旧语义继续执行："
+                Invoke-Upgrade -Target $Target -Local:$Local -Registry:$Registry
+            } else {
+                Invoke-SelfUpdate
+            }
+        }
+        { $_ -in @("upgrade", "up") } {
+            Invoke-Upgrade -Target $Target -Local:$Local -Registry:$Registry
+        }
+        "install" {
+            Invoke-InstallCmd -Mode $Target
         }
         { $_ -in @("status", "s") } {
             Get-ServiceStatus
