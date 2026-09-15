@@ -11,6 +11,16 @@ DeepSeek Harness (DSH) web 服务一站式管理工具。
 
 ## 核心特性
 
+### 三种部署形态
+
+| 形态 | 适用场景 | 管理命令 |
+|------|---------|---------|
+| 官方槽位（npm 全局包） | 日常使用，跟随官方通道升级 | `dshctl update [latest/next/alpha]` |
+| 本地槽位（源码构建） | 开发调试 DSH 本身 | `dshctl update --local <路径>` |
+| Docker 容器 | 不想装 node/systemd，或隔离部署 | `dshctl docker up` |
+
+前两种合称「双槽位架构」，可秒级互切；Docker 是独立的第三种部署形态（见下文 [Docker 部署](#docker-部署)）。
+
 ### 双槽位架构
 
 dshctl 实现了官方包和本地包的双槽位模型，两者互不覆盖，可以随时切换：
@@ -76,15 +86,17 @@ dshctl update --local /path/to/dsh
 
 #### Linux/macOS
 - Bash 4.0+
-- systemd（用户态服务，Linux）
-- Node.js 和 npm
+- systemd（用户态服务，Linux；仅 systemd 部署模式需要）
+- Node.js 和 npm（仅 systemd 部署模式需要）
 - curl（用于健康检查）
 - git（用于克隆源码，本地槽位需要）
 - pnpm（构建本地槽位需要）
+- Docker（仅 docker 部署模式需要）
 
 #### Windows
 - PowerShell 5.1+ 或 PowerShell Core 7+
-- Node.js 和 npm
+- Node.js 和 npm（仅本机部署模式需要）
+- Docker Desktop（仅 docker 部署模式需要）
 - git（用于克隆源码，本地槽位需要）
 - pnpm（构建本地槽位需要）
 
@@ -310,6 +322,54 @@ dshctl disable
 .\dshctl.ps1 stop
 ```
 
+## Docker 部署
+
+**官方没有提供 Docker 镜像**，dshctl 默认封装社区镜像 [`smanx/deepseek-harness`](https://hub.docker.com/r/smanx/deepseek-harness)（维护活跃、开箱即用），可通过环境变量切换到其他镜像。
+
+### 可选镜像对比
+
+| | smanx/deepseek-harness（默认） | runzhliu/deepseek-harness-docker |
+|---|---|---|
+| 定位 | 开箱即用，支持局域网访问 | 生产级安全加固 |
+| 维护 | 活跃（Docker Hub 50K+ 拉取） | 活跃（GitHub，每日上游版本监控） |
+| 局域网访问 | ✅ 内置反向代理（解决 DSH 禁止 `--host 0.0.0.0` 的限制） | ❌ 仅回环发布（安全边界不同） |
+| 认证 | 可选 Basic Auth | launch token + 签名 cookie |
+| 安全加固 | 一般（root 运行） | 强（非 root、cap_drop ALL、只读根文件系统） |
+| 附加能力 | admin 变体带网页管理台（切版本/换源/重启） | 内置 Chromium + noVNC 桌面、Helm chart、Headless 模式 |
+| 体积 | 精简版约 128MB | 更大（含浏览器） |
+
+想换镜像：
+
+```bash
+# Linux/macOS
+export DSHCTL_DOCKER_IMAGE=ghcr.io/runzhliu/deepseek-harness:latest
+dshctl docker up
+
+# Windows
+$env:DSHCTL_DOCKER_IMAGE = "ghcr.io/runzhliu/deepseek-harness:latest"
+.\dshctl.ps1 docker up
+```
+
+### 快速开始
+
+```bash
+# Linux/macOS（Windows 把 dshctl 换成 .\dshctl.ps1）
+dshctl docker up       # 拉镜像并启动容器（首次会拉取约 128MB）
+dshctl docker status   # 容器状态 + 应用应答
+dshctl docker log      # 最近 100 行容器日志
+dshctl docker update   # 拉最新镜像重建容器；起不来自动回退旧镜像
+dshctl docker restart  # 重启容器
+dshctl docker down     # 停止并移除容器（数据卷保留）
+```
+
+行为说明：
+
+- **数据持久化**：会话与配置存在命名卷 `dshctl-dsh-data`（挂载容器 `/root/.dsh`），`down` 或容器删除后数据不丢；彻底清除需 `docker volume rm dshctl-dsh-data`。
+- **开机自启**：容器带 `--restart unless-stopped`，Docker 启动时自动拉起。
+- **端口**：默认宿主 `3080` → 容器 `3080`（`DSHCTL_DOCKER_PORT` 可改）。与 systemd 模式共用端口，两者不能同时运行——`up` 时若检测到 systemd 服务在跑会拒绝并提示。
+- **Basic Auth**（可选，局域网暴露时建议开启）：同时设置 `DSHCTL_DOCKER_AUTH_USER` 和 `DSHCTL_DOCKER_AUTH_PASS` 即启用；只设一个会被 dshctl 拒绝（镜像侧只设一个等于完全放行）。
+- **admin 变体**：镜像名含 `admin` 时自动追加挂载 `dshctl-dsh-install:/opt/dsh`，容器重建后版本切换与 npm 源配置仍保留。
+
 ## 配置
 
 ### 环境变量
@@ -326,6 +386,10 @@ dshctl disable
 | `DSHCTL_PREFLIGHT` | `1` | （不适用） | 是否启用预检（0=禁用，仅 Linux/macOS） |
 | `DSHCTL_PREFLIGHT_TRIES` | `25` | （不适用） | 预检超时秒数（仅 Linux/macOS） |
 | `DSHCTL_PREFLIGHT_PORT` | `3091` | （不适用） | 预检起始端口（仅 Linux/macOS） |
+| `DSHCTL_DOCKER_IMAGE` | `smanx/deepseek-harness:latest` | 同左 | docker 模式使用的镜像 |
+| `DSHCTL_DOCKER_PORT` | `3080` | 同左 | docker 模式宿主端口 |
+| `DSHCTL_DOCKER_AUTH_USER` | 未设置 | 同左 | docker 模式 Basic Auth 用户名（须与密码同时设置） |
+| `DSHCTL_DOCKER_AUTH_PASS` | 未设置 | 同左 | docker 模式 Basic Auth 密码（须与用户名同时设置） |
 
 ### 状态文件
 
@@ -457,6 +521,22 @@ dshctl use official
 3. Node.js 版本不匹配
 
 检查预检日志中的错误信息，更新 profile 或重新安装目标槽位。
+
+### Docker 模式排查
+
+```bash
+dshctl docker status   # 容器状态 + 应用应答码
+dshctl docker log      # 最近容器日志（DSH 本体的输出在最后）
+
+# 容器起不来时看完整日志
+docker logs dshctl-dsh-web
+
+# 端口冲突：docker 模式与 systemd 服务共用 3080，两者只能跑一个
+dshctl stop            # 停 systemd 服务后再 docker up
+
+# 数据卷问题（会话/配置丢失感）确认卷还在
+docker volume inspect dshctl-dsh-data
+```
 
 ### 状态记忆损坏
 
