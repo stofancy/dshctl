@@ -50,7 +50,7 @@ $URL = "http://${DEFAULT_HOST}:${DEFAULT_PORT}"
 
 # dshctl 自身版本与远端基址：update 自更新时对比仓库根的 VERSION 文件。
 # 发版约定：改这里的同时改仓库根 VERSION，两处一致才放行。
-$DSHCTL_VERSION = "0.4.0"
+$DSHCTL_VERSION = "0.4.1"
 $DSHCTL_RAW_BASE = "https://raw.githubusercontent.com/stofancy/dshctl/main"
 
 # 状态目录
