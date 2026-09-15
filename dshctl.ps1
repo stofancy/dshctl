@@ -73,6 +73,14 @@ $script:LOCAL_SLOT = if ($env:DSHCTL_SLOT_DIR) {
     Join-Path $env:USERPROFILE ".local\share\dshctl\slot-local" 
 }
 
+# Docker 部署模式：默认社区镜像 smanx/deepseek-harness（内置反代解决局域网访问），
+# DSHCTL_DOCKER_IMAGE 可换其他镜像。
+$script:DOCKER_IMAGE = if ($env:DSHCTL_DOCKER_IMAGE) { $env:DSHCTL_DOCKER_IMAGE } else { "smanx/deepseek-harness:latest" }
+$script:DOCKER_CONTAINER = "dshctl-dsh-web"
+$script:DOCKER_DATA_VOLUME = "dshctl-dsh-data"
+$script:DOCKER_INSTALL_VOLUME = "dshctl-dsh-install"   # 仅 admin 变体镜像需要
+$script:DOCKER_PORT = if ($env:DSHCTL_DOCKER_PORT) { [int]$env:DSHCTL_DOCKER_PORT } else { 3080 }
+
 # 进程标识文件
 $script:PID_FILE = Join-Path $STATE_DIR "dsh-web.pid"
 
@@ -307,6 +315,253 @@ function Invoke-CloneDshRepo {
             Remove-Item $target -Recurse -Force
         }
         return $null
+    }
+}
+
+# ── Docker 部署模式 ──────────────────────────────────────────────────────
+
+# 检查 docker 可用
+function Test-DockerAvailable {
+    if (-not (Test-Command "docker")) {
+        Write-Error "未找到 docker 命令，请先安装 Docker"
+        return $false
+    }
+    docker info 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "docker daemon 未运行"
+        return $false
+    }
+    return $true
+}
+
+# Basic Auth 凭证成对校验 + 空白字符拒绝（只设其一直接拒绝，不猜）
+function Test-DockerAuthValid {
+    $user = $env:DSHCTL_DOCKER_AUTH_USER
+    $pass = $env:DSHCTL_DOCKER_AUTH_PASS
+    $anySet = -not [string]::IsNullOrEmpty($user) -or -not [string]::IsNullOrEmpty($pass)
+    $bothSet = -not [string]::IsNullOrEmpty($user) -and -not [string]::IsNullOrEmpty($pass)
+    if ($anySet -and -not $bothSet) {
+        Write-Error "DSHCTL_DOCKER_AUTH_USER 与 DSHCTL_DOCKER_AUTH_PASS 必须同时设置才启用认证（只设一个会被镜像放行所有请求）"
+        return $false
+    }
+    foreach ($pair in @(@("DSHCTL_DOCKER_AUTH_USER", $user), @("DSHCTL_DOCKER_AUTH_PASS", $pass))) {
+        if ($pair[1] -match '\s') {
+            Write-Error "$($pair[0]) 含空白字符，无法安全传参"
+            return $false
+        }
+    }
+    return $true
+}
+
+# 用指定镜像（tag 或镜像 ID）启动容器。挂载配置始终由 $script:DOCKER_IMAGE 判断，
+# 与传入镜像解耦——update 回退用旧镜像 ID 重建时挂载保持原样。
+function Start-DockerContainer {
+    param([string]$Image)
+    
+    $runArgs = @(
+        "run", "-d", "--name", $script:DOCKER_CONTAINER,
+        "--restart", "unless-stopped",
+        "-p", "$($script:DOCKER_PORT):3080",
+        "-v", "$($script:DOCKER_DATA_VOLUME):/root/.dsh"
+    )
+    if ($script:DOCKER_IMAGE -match 'admin') {
+        $runArgs += @("-v", "$($script:DOCKER_INSTALL_VOLUME):/opt/dsh")
+    }
+    if (-not [string]::IsNullOrEmpty($env:DSHCTL_DOCKER_AUTH_USER)) {
+        $runArgs += @("-e", "PROXY_USERNAME=$($env:DSHCTL_DOCKER_AUTH_USER)",
+                           "PROXY_PASSWORD=$($env:DSHCTL_DOCKER_AUTH_PASS)")
+    }
+    $runArgs += $Image
+    
+    docker @runArgs 2>&1 | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+
+# 容器是否存在
+function Test-DockerContainerExists {
+    docker container inspect $script:DOCKER_CONTAINER 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+
+# 容器是否在运行
+function Test-DockerContainerRunning {
+    $state = docker container inspect -f '{{.State.Status}}' $script:DOCKER_CONTAINER 2>$null
+    return ($state -eq "running")
+}
+
+function Start-DshDocker {
+    if (-not (Test-DockerAuthValid)) { return $false }
+    
+    if (Test-DockerContainerRunning) {
+        Write-Warning "容器已在运行：$($script:DOCKER_CONTAINER)"
+        Get-DshDockerStatus
+        return $true
+    }
+    
+    Write-Info "镜像：$($script:DOCKER_IMAGE)"
+    Write-Info "端口：$($script:DOCKER_PORT)（宿主）→ 3080（容器内代理）"
+    Write-Info "数据：卷 $($script:DOCKER_DATA_VOLUME) → /root/.dsh"
+    
+    Write-Info "拉取镜像..."
+    docker pull $script:DOCKER_IMAGE 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "镜像拉取失败"
+        return $false
+    }
+    
+    Write-Info "启动容器..."
+    if (-not (Start-DockerContainer $script:DOCKER_IMAGE)) {
+        Write-Error "容器启动失败；若是端口占用，先停掉本机其他占用 $($script:DOCKER_PORT) 的服务"
+        return $false
+    }
+    
+    if (Test-ServiceHealth) {
+        Write-Success "服务已就绪：$($script:URL)"
+        return $true
+    }
+    Write-Error "容器已启动但健康检查未通过，查看日志：.\dshctl.ps1 docker log"
+    return $false
+}
+
+function Stop-DshDocker {
+    if (-not (Test-DockerContainerExists)) {
+        Write-Warning "容器不存在：$($script:DOCKER_CONTAINER)"
+        return $true
+    }
+    Write-Info "停止并移除容器..."
+    docker rm -f $script:DOCKER_CONTAINER 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "容器移除失败"
+        return $false
+    }
+    Write-Success "已停止（数据卷 $($script:DOCKER_DATA_VOLUME) 保留，会话与配置不丢）"
+    return $true
+}
+
+function Restart-DshDocker {
+    if (-not (Test-DockerContainerExists)) {
+        Write-Error "容器不存在，先执行：.\dshctl.ps1 docker up"
+        return $false
+    }
+    Write-Info "重启容器..."
+    docker restart $script:DOCKER_CONTAINER 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "重启失败"
+        return $false
+    }
+    if (Test-ServiceHealth) {
+        Write-Success "服务已就绪：$($script:URL)"
+        return $true
+    }
+    Write-Error "重启后健康检查未通过，查看日志：.\dshctl.ps1 docker log"
+    return $false
+}
+
+function Get-DshDockerStatus {
+    if (-not (Test-DockerContainerExists)) {
+        Write-Warning "容器未创建（docker 模式未部署）。启动：.\dshctl.ps1 docker up"
+        return $false
+    }
+    docker ps -a --filter "name=^$($script:DOCKER_CONTAINER)$" `
+        --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+    try {
+        $response = Invoke-WebRequest -Uri "$($script:URL)/" -Method Head -TimeoutSec 3 -ErrorAction Stop
+        Write-Host "应用应答：HTTP $($response.StatusCode)（$($script:URL)）"
+    } catch {
+        $code = 0
+        if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+        if ($code -gt 0) {
+            Write-Host "应用应答：HTTP $code（$($script:URL)）"
+        } else {
+            Write-Host "应用应答：无（服务未就绪）"
+        }
+    }
+    return $true
+}
+
+function Show-DshDockerLog {
+    if (-not (Test-DockerContainerExists) ) {
+        Write-Error "容器不存在：$($script:DOCKER_CONTAINER)"
+        return $false
+    }
+    docker logs --tail 100 $script:DOCKER_CONTAINER
+    return ($LASTEXITCODE -eq 0)
+}
+
+# 拉最新镜像并重建容器；新镜像起不来时回退旧镜像（与 Bash 版同一硬约束）。
+function Update-DshDocker {
+    if (-not (Test-DockerAuthValid)) { return $false }
+    
+    $oldImage = ""
+    if (Test-DockerContainerExists) {
+        $oldImage = (docker container inspect -f '{{.Image}}' $script:DOCKER_CONTAINER 2>$null)
+    }
+    
+    Write-Info "拉取最新镜像..."
+    docker pull $script:DOCKER_IMAGE 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "镜像拉取失败"
+        return $false
+    }
+    
+    $newImage = (docker image inspect -f '{{.Id}}' $script:DOCKER_IMAGE 2>$null)
+    if (-not $newImage) {
+        Write-Error "读不到镜像 ID：$($script:DOCKER_IMAGE)"
+        return $false
+    }
+    
+    if ($oldImage -eq $newImage) {
+        Write-Success "镜像已是最新：$($script:DOCKER_IMAGE)"
+        return $true
+    }
+    
+    if ($script:DryRun) {
+        Write-Warning "[DRY RUN] 会用新镜像重建容器并重启"
+        return $true
+    }
+    
+    Write-Info "镜像有更新，重建容器（数据卷保留）..."
+    docker rm -f $script:DOCKER_CONTAINER 2>&1 | Out-Null
+    
+    if ((Start-DockerContainer $script:DOCKER_IMAGE) -and (Test-ServiceHealth)) {
+        Write-Success "已更新并就绪：$($script:URL)"
+        return $true
+    }
+    
+    Write-Warning "新容器未就绪，回退到上一镜像..."
+    docker rm -f $script:DOCKER_CONTAINER 2>&1 | Out-Null
+    if ($oldImage -and (Start-DockerContainer $oldImage) -and (Test-ServiceHealth)) {
+        Write-Warning "已回退到旧镜像，服务恢复运行；新镜像问题可看：docker logs $($script:DOCKER_CONTAINER)"
+    } else {
+        Write-Error "回退也失败了，手动排查：docker pull $($script:DOCKER_IMAGE) 后 .\dshctl.ps1 docker up"
+    }
+    return $false
+}
+
+# docker 子命令分发：.\dshctl.ps1 docker up|down|restart|status|log|update
+function Invoke-Docker {
+    param([string]$Action)
+    
+    if (-not (Test-DockerAvailable)) { return }
+    # docker 模式按实际对外端口做健康检查
+    $script:URL = "http://127.0.0.1:$($script:DOCKER_PORT)"
+    
+    switch ($Action) {
+        "up"      { Start-DshDocker }
+        "down"    { Stop-DshDocker }
+        "restart" { Restart-DshDocker }
+        "status"  { Get-DshDockerStatus }
+        "log"     { Show-DshDockerLog }
+        "update"  { Update-DshDocker }
+        "" {
+            Write-Host "用法：.\dshctl.ps1 docker up|down|restart|status|log|update"
+            Write-Host "  镜像：$($script:DOCKER_IMAGE)（DSHCTL_DOCKER_IMAGE 可覆盖）"
+            Write-Host "  端口：$($script:DOCKER_PORT) → 容器 3080（DSHCTL_DOCKER_PORT 可覆盖）"
+        }
+        default {
+            Write-Error "未知 docker 子命令：$Action"
+            Write-Host "用法：.\dshctl.ps1 docker up|down|restart|status|log|update"
+        }
     }
 }
 
@@ -800,6 +1055,7 @@ dshctl.ps1 - DeepSeek Harness web 服务管理工具 (Windows 版本)
   log                     查看最近日志
   source                  查看当前运行来源与槽位信息
   use <来源>              切换运行来源（official/local）
+  docker <操作>           Docker 部署管理（up/down/restart/status/log/update）
   help                    显示帮助信息
 
 通道/版本示例：
@@ -862,6 +1118,9 @@ function Main {
         }
         { $_ -in @("use", "switch") } {
             Invoke-UseSource $Target
+        }
+        "docker" {
+            Invoke-Docker -Action $Target
         }
         { $_ -in @("source", "src") } {
             Show-Source
