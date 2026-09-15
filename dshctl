@@ -38,6 +38,11 @@ URL="http://127.0.0.1:3080"
 HELP="$HOME/.config/dsh-web-help.txt"
 PACKAGE_NAME="@deepseek-ai/dsh"
 
+# dshctl 自身版本与远端基址：update 自更新时对比仓库根的 VERSION 文件。
+# 发版约定：改这里的同时改仓库根 VERSION，两处一致才放行。
+DSHCTL_VERSION="0.4.0"
+DSHCTL_RAW_BASE="https://raw.githubusercontent.com/stofancy/dshctl/main"
+
 # 预演开关：由入口的 --dry-run 置 1；只打印将要执行的来源与制品，不安装、不切换、不重启。
 DRY_RUN=0
 # 重启开关：由入口的 --no-restart 置 0；装完不重启（分阶段部署 / 手工安排重启时用）。
@@ -172,6 +177,151 @@ spinner() {
     elif [ $rc -eq 124 ]; then echo "✘ 超时"
     else echo "✘ 失败 (exit=$rc)"; fi
     return $rc
+}
+
+# ── dshctl 自身：更新与安装 ──────────────────────────────────────────────
+# 更新 dshctl 自己（不是 dsh）：从仓库拉最新脚本，校验后原子替换。
+# 校验三道：bash 语法必须过、版本号必须是远端 VERSION 宣称的那个、下载失败不动原文件——
+# 半截脚本或 404 错误页绝不能把正在用的 dshctl 换坏。
+self_update() {
+    local self tmp remote
+    command -v curl >/dev/null 2>&1 || { echo "自更新需要 curl，未做任何改动" >&2; return 1; }
+    self=$(readlink -f "${BASH_SOURCE[0]}")
+    remote=$(curl -fsSL --max-time 20 "$DSHCTL_RAW_BASE/VERSION" 2>/dev/null | tr -d '[:space:]')
+    case "$remote" in
+        [0-9]*.[0-9]*.[0-9]*) ;;
+        "") echo "取不到远端版本号（网络问题？），未做任何改动" >&2; return 1 ;;
+        *)  echo "远端版本号异常：$remote，未做任何改动" >&2; return 1 ;;
+    esac
+    if [ "$remote" = "$DSHCTL_VERSION" ]; then
+        echo "✓ dshctl 已是最新（$DSHCTL_VERSION）"
+        return 0
+    fi
+    echo "  发现新版本：$DSHCTL_VERSION → $remote"
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "── [dry-run] 只报版本不更新（去掉 --dry-run 才会真正执行）──"
+        return 0
+    fi
+    tmp=$(mktemp "${TMPDIR:-/tmp}/dshctl-XXXXXX") || return 1
+    if ! curl -fsSL --max-time 60 "$DSHCTL_RAW_BASE/dshctl" -o "$tmp"; then
+        rm -f "$tmp"
+        echo "下载新版失败，未做任何改动" >&2
+        return 1
+    fi
+    if ! bash -n "$tmp" 2>/dev/null || ! grep -q "DSHCTL_VERSION=\"$remote\"" "$tmp"; then
+        rm -f "$tmp"
+        echo "下载内容校验未通过（语法或版本不符），未做任何改动" >&2
+        return 1
+    fi
+    chmod --reference="$self" "$tmp" 2>/dev/null || chmod +x "$tmp"
+    if ! mv -f "$tmp" "$self"; then
+        rm -f "$tmp"
+        echo "无法写入 $self（权限问题？），未做任何改动" >&2
+        return 1
+    fi
+    echo "✓ dshctl 已更新到 $remote（当前进程仍是旧版，重新运行 dshctl 即生效）"
+}
+
+# 生成 systemd 用户 unit（dsh 本体的服务骨架）。官方包装没装时 ExecStart 指向
+# 未来安装位置（npm 全局 bin），装好后 start 即可跑。
+default_help_text() {
+    cat <<'EOF'
+dshctl - DeepSeek Harness web 服务管理工具
+
+常用命令：
+  dshctl upgrade           升级当前槽位的 dsh（v0.4 前叫 update）
+  dshctl update            更新 dshctl 自身
+  dshctl install           首次安装：装 dshctl + systemd 服务骨架
+  dshctl status            查看服务状态
+  dshctl restart           重启服务
+  dshctl log               查看最近日志
+  dshctl source            查看当前运行来源与槽位信息
+  dshctl use <来源>        切换运行来源（official/local）
+  dshctl check             预检槽位是否可用
+  dshctl docker <操作>     Docker 部署管理（up/down/status/log/update）
+  dshctl help              显示帮助信息
+
+无参数运行时进入交互菜单。
+EOF
+}
+
+write_unit_file() {
+    local unit_dir="$HOME/.config/systemd/user" bin_prefix="$1"
+    mkdir -p "$unit_dir" || return 1
+    cat > "$unit_dir/$UNIT" <<EOF
+[Unit]
+Description=DeepSeek Harness Web (dsh)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$bin_prefix/dsh web --host 127.0.0.1 --port 3080
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+}
+
+# dshctl install [--docker]：首次安装向导——装 dshctl 自身到 PATH、建服务骨架，
+# 不替用户做版本决定（装哪个 dsh 由 upgrade / docker up 完成）。
+do_install_cmd() {
+    local mode="${1:-}" self bin_dir bin_prefix
+    case "$mode" in
+        ""|--docker|-d) ;;
+        *) echo "用法：dshctl install [--docker]" >&2; return 2 ;;
+    esac
+
+    self=$(readlink -f "${BASH_SOURCE[0]}")
+    bin_dir="$HOME/.local/bin"
+
+    echo "── [1/3] 安装 dshctl ──"
+    if [ "$(command -v dshctl 2>/dev/null)" = "$self" ]; then
+        echo "  ✓ 已在 PATH：$self"
+    else
+        mkdir -p "$bin_dir" || return 1
+        if [ "$self" != "$bin_dir/dshctl" ]; then
+            cp -f "$self" "$bin_dir/dshctl" && chmod +x "$bin_dir/dshctl" || return 1
+        fi
+        echo "  ✓ 已安装：$bin_dir/dshctl"
+        case ":$PATH:" in
+            *":$bin_dir:"*) ;;
+            *) echo "  ⚠ $bin_dir 不在 PATH，请加入 shell 配置：export PATH=\"$bin_dir:\$PATH\"" ;;
+        esac
+    fi
+
+    echo "── [2/3] 帮助文件 ──"
+    if [ -f "$HELP" ]; then
+        echo "  ✓ 已存在：$HELP"
+    else
+        mkdir -p "$(dirname "$HELP")" && default_help_text > "$HELP" \
+            && echo "  ✓ 已生成：$HELP" || return 1
+    fi
+
+    echo "── [3/3] 服务骨架 ──"
+    if [ "$mode" = "--docker" ] || [ "$mode" = "-d" ]; then
+        echo "  已选 docker 部署，跳过 systemd unit"
+        echo
+        echo "下一步：dshctl docker up"
+        return 0
+    fi
+    if systemctl --user show "$UNIT" -p FragmentPath --value 2>/dev/null | grep -q .; then
+        echo "  ✓ unit 已存在：$UNIT"
+    else
+        if ! command -v npm >/dev/null 2>&1; then
+            echo "  ⚠ 未找到 npm：先装 Node.js 再跑 dshctl install，或改用 docker 部署（dshctl install --docker）" >&2
+            return 1
+        fi
+        bin_prefix=$(npm prefix -g 2>/dev/null)/bin
+        [ -n "${bin_prefix:-}" ] && [ "$bin_prefix" != "/bin" ] || { echo "  取不到 npm 全局前缀" >&2; return 1; }
+        write_unit_file "$bin_prefix" || return 1
+        echo "  ✓ 已生成 unit（ExecStart 指向 $bin_prefix/dsh）"
+    fi
+    echo
+    echo "下一步：dshctl upgrade    # 安装/升级官方包 dsh，装完自动重启服务"
+    return 0
 }
 
 # ── 运行槽位（双槽位切换的唯一开关）──────────────────────────────────────
@@ -1165,7 +1315,7 @@ run_menu() {
         echo "========================================="
         echo "  dsh web 服务管理    $URL"
         echo "========================================="
-        echo "  1) 更新 dsh（运行来源 $("$(current_source)"_label)，升级并按需切换）"
+        echo "  1) 升级 dsh（运行来源 $("$(current_source)"_label)，升级并按需切换）"
         echo "  2) 查看运行状态"
         echo "  3) 查看最近日志"
         echo "  4) 重启服务"
@@ -1173,16 +1323,17 @@ run_menu() {
         echo "  6) 启动服务"
         echo "  7) 取消开机自启"
         echo "  8) 查看完整说明（help）"
-        echo "  9) 切换更新通道并更新（latest/next/alpha）"
+        echo "  9) 切换更新通道并升级（latest/next/alpha）"
         echo " 10) 从本地包安装/升级（源码仓库或 tgz 目录）"
         echo " 11) 查看当前运行来源与两个槽位"
         echo " 12) 只切换运行来源（官方包 ↔ 本地槽位）"
         echo " 13) Docker 部署管理（up/down/status/log/update）"
+        echo " 14) 更新 dshctl 自身（update）"
         echo "  0) 退出"
         echo "-----------------------------------------"
-        echo "  也可直接敲：dshctl update [--local 路径] / dshctl use local / dshctl source ..."
+        echo "  也可直接敲：dshctl upgrade [--local 路径] / dshctl docker up / dshctl update ..."
         echo "========================================="
-        printf '  请选择 [0-9] 或 10/11/12/13: '
+        printf '  请选择 [0-9] 或 10-14: '
     }
     pause() {
         echo
@@ -1222,8 +1373,9 @@ run_menu() {
                     up|down|restart|status|log|update) do_docker "$dact" ;;
                     *) docker_available && docker_usage ;;
                 esac ;;
+            14) self_update ;;
             0) break ;;
-            *) echo "无效选择：$choice（请输入 0-9 或 10/11/12/13）" ;;
+            *) echo "无效选择：$choice（请输入 0-9 或 10-14）" ;;
         esac
         pause
     done
@@ -1234,7 +1386,9 @@ run_menu() {
 # 打印帮助。带子命令时先给该子命令的用法，再给完整说明；只输出，不产生任何副作用。
 show_usage() {
     case "${1:-}" in
-        update|u)     echo "用法：dshctl update [通道|版本] [--local 路径] [--registry] [--dry-run] [--no-restart]" ;;
+        update|u)     echo "用法：dshctl update（更新 dshctl 自身；升级 dsh 请用 dshctl upgrade）" ;;
+        upgrade|up)   echo "用法：dshctl upgrade [通道|版本] [--local 路径] [--registry] [--dry-run] [--no-restart]" ;;
+        install)      echo "用法：dshctl install [--docker]（首次安装：装 dshctl + 服务骨架）" ;;
         use|switch)   echo "用法：dshctl use official|local" ;;
         check|verify) echo "用法：dshctl check [official|local]（只预检能否用当前 profile 启动，不切换、不重启）" ;;
         docker)       echo "用法：dshctl docker up|down|restart|status|log|update（容器化部署，镜像可用 DSHCTL_DOCKER_IMAGE 覆盖）" ;;
@@ -1250,7 +1404,7 @@ main() {
     # 帮助优先：命令行里只要有 help / -h / --help，就只打印帮助，绝不执行子命令。
     for arg in "$@"; do
         case "$arg" in
-            help|-h|--help) show_usage "${1:-}"; return 0 ;;
+            help|-h|--help) show_usage "${2:-}"; return 0 ;;
         esac
     done
     # 过程开关之外的「- 开头」参数都算不认识：宁可拒绝执行，也不当普通参数猜。
@@ -1291,13 +1445,29 @@ main() {
     case "${1:-}" in
         "" )              run_menu ;;
         update|u)
+            # v0.4 起 update 只管 dshctl 自身；带参数的旧用法转发到 upgrade（提示迁移）。
+            if [ "${2:-}" = "" ] || [ "${2:-}" = "--dry-run" ] || [ "${2:-}" = "-n" ]; then
+                self_update
+            else
+                echo "⚠ v0.4 起 dshctl update 只更新 dshctl 自身；升级 dsh 请用 dshctl upgrade" >&2
+                echo "  本次已按旧语义继续执行：" >&2
+                case "${2:-}" in
+                    --local|-l)    do_install local "${3:-}" ;;
+                    --registry|-r) do_install registry "${3:-}" ;;
+                    * )            do_install registry "${2:-}" ;;
+                esac
+            fi ;;
+        upgrade|up)
             case "${2:-}" in
                 "" )           do_install "$(current_source)" "" ;;
                 --local|-l)    do_install local "${3:-}" ;;
                 --registry|-r) do_install registry "${3:-}" ;;
                 * )            do_install registry "$2" ;;
             esac ;;
-        update-local|local|ul) do_install local "${2:-}" ;;
+        install)          do_install_cmd "${2:-}" ;;
+        update-local|local|ul)
+            echo "提示：新版命令是 dshctl upgrade --local（旧写法仍可用）" >&2
+            do_install local "${2:-}" ;;
         use|switch)       use_source "${2:-}" ;;
         check|verify)     check_slots "${2:-}" ;;
         source|src)       show_source ;;
@@ -1308,7 +1478,7 @@ main() {
         stop)             systemctl --user stop "$UNIT" ;;
         start)            systemctl --user start "$UNIT" ;;
         disable)          systemctl --user disable "$UNIT" ;;
-        help|h|-h|--help) cat "$HELP" ;;
+        help|h|-h|--help) show_usage "${2:-}" ;;
         * )
             echo "未知命令：$1" >&2
             echo
