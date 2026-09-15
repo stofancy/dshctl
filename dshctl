@@ -53,6 +53,10 @@ LOCAL_DETAIL_FILE="$STATE_DIR/local-detail" # 本地槽位的制品描述（展�
 # 可用 DSHCTL_PACK_DIR 覆盖。
 LOCAL_PACK_DIR="${DSHCTL_PACK_DIR:-$HOME/.cache/dshctl/pack}"
 
+# DSH 源码仓库的默认克隆位置
+DSH_REPO_URL="https://github.com/deepseek-ai/dsh.git"
+DSH_DEFAULT_CLONE_DIR="$HOME/.cache/dshctl/dsh-repo"
+
 # 本地槽位：独立 prefix，与全局 npm 树完全隔离。
 LOCAL_SLOT="${DSHCTL_SLOT_DIR:-$HOME/.local/share/dshctl/slot-local}"
 
@@ -362,14 +366,101 @@ local_kind() {
     fi
 }
 
+# 提示用户是否克隆 DSH 源码仓库
+prompt_clone_dsh() {
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    echo "⚠️  本地槽位需要 DeepSeek Harness 源码仓库" >&2
+    echo "" >&2
+    echo "本地槽位用于从源码构建 DSH，需要完整的源码仓库。" >&2
+    echo "如果您只是想使用稳定版本，建议使用官方包：" >&2
+    echo "  dshctl update latest" >&2
+    echo "" >&2
+    echo "是否自动克隆 DSH 源码仓库到：" >&2
+    echo "  $DSH_DEFAULT_CLONE_DIR" >&2
+    echo "" >&2
+    echo "仓库地址：$DSH_REPO_URL" >&2
+    echo "克隆大小：约 100MB，首次构建需要数分钟" >&2
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    printf '是否继续克隆？[y/N]: ' >&2
+    
+    # 非交互环境直接拒绝
+    if [ ! -t 0 ]; then
+        echo "N (非交互环境，已拒绝)" >&2
+        return 1
+    fi
+    
+    local answer
+    read -r answer || return 1
+    case "${answer,,}" in
+        y|yes|是) return 0 ;;
+        *) 
+            echo "" >&2
+            echo "已取消。建议使用官方包：dshctl update latest" >&2
+            return 1 ;;
+    esac
+}
+
+# 克隆 DSH 源码仓库
+clone_dsh_repo() {
+    local target="$DSH_DEFAULT_CLONE_DIR"
+    
+    if [ -d "$target" ]; then
+        echo "  目标目录已存在：$target" >&2
+        if [ -d "$target/.git" ]; then
+            echo "  检测到已有 git 仓库，尝试更新..." >&2
+            if git -C "$target" pull --ff-only 2>/dev/null; then
+                echo "  ✓ 已更新到最新版本" >&2
+                return 0
+            else
+                echo "  ⚠ 更新失败，将使用现有版本" >&2
+                return 0
+            fi
+        fi
+    fi
+    
+    echo "  开始克隆 DSH 源码仓库..." >&2
+    echo "  仓库：$DSH_REPO_URL" >&2
+    echo "  目标：$target" >&2
+    
+    if ! command -v git >/dev/null 2>&1; then
+        echo "  ✘ 未找到 git 命令，无法克隆仓库" >&2
+        return 1
+    fi
+    
+    mkdir -p "$(dirname "$target")" || return 1
+    
+    if spinner "克隆中（可能需要数分钟）" -- \
+        git clone --depth 1 "$DSH_REPO_URL" "$target"; then
+        echo "  ✓ 克隆完成：$target" >&2
+        return 0
+    else
+        echo "  ✘ 克隆失败" >&2
+        rm -rf "$target"
+        return 1
+    fi
+}
+
 local_validate() {
     local target kind
     target=$(local_target "$1")
+    
+    # 未指定路径且没有记忆：提示是否克隆
     if [ -z "$target" ]; then
-        echo "未指定本地包路径，也没有记住过路径。" >&2
-        echo "用法：dshctl update --local <源码仓库 | 已打包的 tgz 目录 | 单个 .tgz>" >&2
-        return 2
+        if ! prompt_clone_dsh; then
+            return 2
+        fi
+        if ! clone_dsh_repo; then
+            echo "" >&2
+            echo "克隆失败。您也可以手动克隆后再试：" >&2
+            echo "  git clone $DSH_REPO_URL /path/to/dsh" >&2
+            echo "  dshctl update --local /path/to/dsh" >&2
+            return 2
+        fi
+        target="$DSH_DEFAULT_CLONE_DIR"
+        # 更新 local_target 的返回值，让后续流程使用克隆的路径
+        write_state "$LOCAL_PATH_FILE" "$target"
     fi
+    
     if [ ! -e "$target" ]; then
         echo "本地路径不存在：$target" >&2
         return 2

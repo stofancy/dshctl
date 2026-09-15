@@ -4,7 +4,10 @@ DeepSeek Harness (DSH) web 服务一站式管理工具。
 
 ## 简介
 
-`dshctl` 是一个 Bash 脚本，用于管理 DeepSeek Harness web 服务的生命周期，包括安装、更新、启动、停止、日志查看等操作。它封装了底层的 systemctl、journalctl 和 npm 命令，提供统一的管理接口。
+`dshctl` 是一个跨平台的服务管理工具，用于管理 DeepSeek Harness web 服务的生命周期，包括安装、更新、启动、停止、日志查看等操作。
+
+- **Linux/macOS**：`dshctl` Bash 脚本，封装 systemctl、journalctl 和 npm 命令
+- **Windows**：`dshctl.ps1` PowerShell 脚本，提供相同功能的 Windows 实现
 
 ## 核心特性
 
@@ -15,7 +18,41 @@ dshctl 实现了官方包和本地包的双槽位模型，两者互不覆盖，�
 - **官方槽位（registry）**：全局 npm 安装的 `@deepseek-ai/dsh` 包
 - **本地槽位（local）**：独立 prefix 中的本地构建版本
 
-切换只需写入/删除一个 systemd drop-in 配置文件，秒级完成，服务随时可回退。
+切换只需修改配置文件（Linux 用 systemd drop-in，Windows 用状态文件），秒级完成，服务随时可回退。
+
+### 本地槽位说明
+
+**重要**：本地槽位需要 DeepSeek Harness 的完整源码仓库才能工作。
+
+本地槽位用于从源码构建 DSH，适合以下场景：
+- 开发和调试 DSH
+- 测试未发布的功能
+- 使用自定义修改版本
+
+如果您只是想使用稳定版本，**建议使用官方包**：
+```bash
+# Linux/macOS
+dshctl update latest
+
+# Windows
+.\dshctl.ps1 update latest
+```
+
+首次使用本地槽位时，如果未指定路径，dshctl 会询问是否自动克隆 DSH 源码仓库：
+- 同意：自动克隆到 `~/.cache/dshctl/dsh-repo`（Linux/macOS）或 `%USERPROFILE%\.cache\dshctl\dsh-repo`（Windows）
+- 拒绝：退出安装，建议使用官方包
+
+您也可以手动克隆并指定路径：
+```bash
+# 手动克隆
+git clone https://github.com/deepseek-ai/dsh.git /path/to/dsh
+
+# Linux/macOS
+dshctl update --local /path/to/dsh
+
+# Windows
+.\dshctl.ps1 update -Local C:\path\to\dsh
+```
 
 ### 预检机制
 
@@ -37,12 +74,23 @@ dshctl 实现了官方包和本地包的双槽位模型，两者互不覆盖，�
 
 ### 前置要求
 
+#### Linux/macOS
 - Bash 4.0+
-- systemd（用户态服务）
-- Node.js 和 npm/pnpm
+- systemd（用户态服务，Linux）
+- Node.js 和 npm
 - curl（用于健康检查）
+- git（用于克隆源码，本地槽位需要）
+- pnpm（构建本地槽位需要）
+
+#### Windows
+- PowerShell 5.1+ 或 PowerShell Core 7+
+- Node.js 和 npm
+- git（用于克隆源码，本地槽位需要）
+- pnpm（构建本地槽位需要）
 
 ### 安装步骤
+
+#### Linux/macOS
 
 1. 下载脚本：
 
@@ -92,9 +140,42 @@ dshctl - DeepSeek Harness web 服务管理工具
 无参数运行时进入交互菜单。
 ```
 
+#### Windows
+
+1. 下载脚本：
+
+```powershell
+# 使用 PowerShell
+$url = "https://raw.githubusercontent.com/stofancy/dshctl/main/dshctl.ps1"
+$output = "$env:USERPROFILE\.local\bin\dshctl.ps1"
+New-Item -ItemType Directory -Force -Path (Split-Path $output) | Out-Null
+Invoke-WebRequest -Uri $url -OutFile $output
+```
+
+或者直接从 GitHub 下载后放到合适的位置。
+
+2. （可选）添加到 PATH 或创建别名：
+
+```powershell
+# 在 PowerShell profile 中添加别名
+Set-Alias -Name dshctl -Value "$env:USERPROFILE\.local\bin\dshctl.ps1"
+
+# 或者添加目录到 PATH
+$env:PATH += ";$env:USERPROFILE\.local\bin"
+```
+
+3. 执行策略（首次运行可能需要）：
+
+```powershell
+# 允许执行本地脚本
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+**注意**：Windows 版本不依赖 systemd，服务管理通过进程和 PID 文件实现。
+
 ## 使用方法
 
-### 交互式菜单
+### 交互式菜单（仅 Linux/macOS）
 
 直接运行 `dshctl`（无参数）进入交互菜单：
 
@@ -102,10 +183,17 @@ dshctl - DeepSeek Harness web 服务管理工具
 dshctl
 ```
 
+Windows 版本无交互菜单，直接运行会显示服务状态：
+
+```powershell
+.\dshctl.ps1  # 显示状态
+```
+
 ### 命令行模式
 
 #### 更新管理
 
+**Linux/macOS:**
 ```bash
 # 升级当前运行来源（沿用记忆的通道）
 dshctl update
@@ -116,7 +204,8 @@ dshctl update next
 dshctl update alpha
 dshctl update 0.1.5-rc.2
 
-# 从本地源码仓库构建并安装
+# 从本地源码仓库构建并安装（未指定路径会提示克隆）
+dshctl update --local
 dshctl update --local /path/to/dsh-repo
 
 # 从已打包的 tarball 目录安装
@@ -132,8 +221,30 @@ dshctl update --dry-run
 dshctl update --no-restart
 ```
 
+**Windows:**
+```powershell
+# 升级当前运行来源
+.\dshctl.ps1 update
+
+# 从指定通道安装官方包
+.\dshctl.ps1 update latest
+.\dshctl.ps1 update next
+.\dshctl.ps1 update 0.1.5-rc.2
+
+# 从本地源码构建并安装（未指定路径会提示克隆）
+.\dshctl.ps1 update -Local
+.\dshctl.ps1 update -Local C:\path\to\dsh-repo
+
+# 预演模式
+.\dshctl.ps1 update -DryRun
+
+# 安装但不重启服务
+.\dshctl.ps1 update -NoRestart
+```
+
 #### 槽位切换
 
+**Linux/macOS:**
 ```bash
 # 查看当前运行来源和两个槽位的版本
 dshctl source
@@ -144,14 +255,27 @@ dshctl use official
 # 切换到本地包
 dshctl use local
 
-# 预检槽位是否可用（不切换）
+# 预检槽位是否可用（不切换，仅 Linux/macOS）
 dshctl check
 dshctl check official
 dshctl check local
 ```
 
+**Windows:**
+```powershell
+# 查看当前运行来源
+.\dshctl.ps1 source
+
+# 切换到官方包
+.\dshctl.ps1 use official
+
+# 切换到本地包
+.\dshctl.ps1 use local
+```
+
 #### 服务管理
 
+**Linux/macOS:**
 ```bash
 # 查看服务状态
 dshctl status
@@ -166,8 +290,24 @@ dshctl restart
 dshctl start
 dshctl stop
 
-# 取消开机自启
+# 取消开机自启（仅 Linux）
 dshctl disable
+```
+
+**Windows:**
+```powershell
+# 查看服务状态
+.\dshctl.ps1 status
+
+# 查看最近日志
+.\dshctl.ps1 log
+
+# 重启服务
+.\dshctl.ps1 restart
+
+# 启动/停止服务
+.\dshctl.ps1 start
+.\dshctl.ps1 stop
 ```
 
 ## 配置
@@ -176,32 +316,38 @@ dshctl disable
 
 可通过环境变量自定义 dshctl 的行为：
 
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `DSHCTL_PACK_DIR` | `~/.cache/dshctl/pack` | 本地源码打包输出目录 |
-| `DSHCTL_SLOT_DIR` | `~/.local/share/dshctl/slot-local` | 本地槽位安装目录 |
-| `DSHCTL_LOCAL_NODE_FLAGS` | `--expose-internals` | 拉起本地槽位时 node 的额外参数 |
-| `DSHCTL_GLOBAL_ROOT` | 自动检测 | 全局 npm 根目录 |
-| `DSHCTL_HEALTH_TRIES` | `30` | 健康检查重试次数 |
-| `DSHCTL_PREFLIGHT` | `1` | 是否启用预检（0=禁用） |
-| `DSHCTL_PREFLIGHT_TRIES` | `25` | 预检超时秒数 |
-| `DSHCTL_PREFLIGHT_PORT` | `3091` | 预检起始端口 |
+| 变量名 | 默认值（Linux/macOS） | 默认值（Windows） | 说明 |
+|--------|---------------------|------------------|------|
+| `DSHCTL_PACK_DIR` | `~/.cache/dshctl/pack` | `%USERPROFILE%\.cache\dshctl\pack` | 本地源码打包输出目录 |
+| `DSHCTL_SLOT_DIR` | `~/.local/share/dshctl/slot-local` | `%USERPROFILE%\.local\share\dshctl\slot-local` | 本地槽位安装目录 |
+| `DSHCTL_LOCAL_NODE_FLAGS` | `--expose-internals` | （不适用） | 拉起本地槽位时 node 的额外参数（仅 Linux/macOS） |
+| `DSHCTL_GLOBAL_ROOT` | 自动检测 | 自动检测 | 全局 npm 根目录 |
+| `DSHCTL_HEALTH_TRIES` | `30` | （不适用） | 健康检查重试次数（仅 Linux） |
+| `DSHCTL_PREFLIGHT` | `1` | （不适用） | 是否启用预检（0=禁用，仅 Linux/macOS） |
+| `DSHCTL_PREFLIGHT_TRIES` | `25` | （不适用） | 预检超时秒数（仅 Linux/macOS） |
+| `DSHCTL_PREFLIGHT_PORT` | `3091` | （不适用） | 预检起始端口（仅 Linux/macOS） |
 
 ### 状态文件
 
-dshctl 将状态保存在 `~/.config/dsh/` 目录：
+**Linux/macOS:** `~/.config/dsh/`
+**Windows:** `%USERPROFILE%\.config\dsh\`
 
 - `channel` - 官方包的更新通道记忆
 - `local-path` - 本地包的构建来源路径
 - `local-detail` - 本地包的制品描述信息
+- `current-source` - 当前运行来源（Windows）
+- `dsh-web.pid` - 服务进程 ID（Windows）
 
-### 切换文件
+### 切换机制
 
+**Linux/macOS:**
 运行槽位由 systemd drop-in 控制：
-
 - `~/.config/systemd/user/dsh-web.service.d/50-dshctl-slot.conf`
   - 文件存在 → 运行本地槽位
   - 文件不存在 → 运行官方槽位
+
+**Windows:**
+运行槽位由状态文件 `current-source` 记录，服务管理通过进程和 PID 文件实现。
 
 ## 工作原理
 
