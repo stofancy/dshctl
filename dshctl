@@ -70,6 +70,16 @@ DROPIN_DIR="$HOME/.config/systemd/user/$UNIT.d"
 DROPIN="$DROPIN_DIR/50-dshctl-slot.conf"
 LEGACY_DROPIN="$DROPIN_DIR/50-dshctl-source.conf"
 
+# ── Docker 部署模式 ──────────────────────────────────────────────────────
+# 第三种部署形态：不装 node、不用 systemd，直接跑现成容器。
+# 官方没有 Docker 镜像，默认用社区镜像 smanx/deepseek-harness（内置反向代理，
+# 解决 DSH 禁止 --host 0.0.0.0 的局域网访问问题）；想换别的镜像用环境变量覆盖。
+DOCKER_IMAGE="${DSHCTL_DOCKER_IMAGE:-smanx/deepseek-harness:latest}"
+DOCKER_CONTAINER="dshctl-dsh-web"
+DOCKER_DATA_VOLUME="dshctl-dsh-data"        # 挂 /root/.dsh，会话与配置持久化
+DOCKER_INSTALL_VOLUME="dshctl-dsh-install"  # 仅 admin 变体镜像需要（挂 /opt/dsh）
+DOCKER_PORT="${DSHCTL_DOCKER_PORT:-3080}"
+
 # ── 状态读写 ─────────────────────────────────────────────────────────────
 # 读取枚举型状态。文件缺失或不可读时输出空串，由调用方决定回退值；
 # 绝不因为状态文件损坏而中断。
@@ -686,6 +696,16 @@ restart_checked() {
     return 1
 }
 
+# 服务进程是否在运行：systemd 模式看 unit 状态，docker 模式看容器状态。
+# 由 do_docker 入口设置 DSHCTL_MODE=docker，其余路径默认 systemd。
+service_alive() {
+    if [ "${DSHCTL_MODE:-systemd}" = "docker" ]; then
+        [ "$(docker container inspect -f '{{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null)" = "running" ]
+    else
+        systemctl --user is-active --quiet "$UNIT"
+    fi
+}
+
 # 等待服务真正可用：进程 active，且根路径给出应用级应答（认证重定向 3xx 或 401）。
 # 连不上、404、5xx 都算没起来——实测本地槽位缺 node flag 时正是先 404 再崩，
 # 只看 systemctl is-active 会漏判（进程起来一秒后照样退出）。
@@ -693,12 +713,12 @@ wait_healthy() {
     local i code
     if ! command -v curl >/dev/null 2>&1; then
         sleep 3
-        systemctl --user is-active --quiet "$UNIT"
+        service_alive
         return $?
     fi
     local tries="${DSHCTL_HEALTH_TRIES:-30}"
     for i in $(seq 1 "$tries"); do
-        if systemctl --user is-active --quiet "$UNIT"; then
+        if service_alive; then
             code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$URL/" 2>/dev/null || true)
             case "$code" in
                 ""|000|404|5*) : ;;
@@ -944,6 +964,200 @@ show_source() {
     echo "切换（不重装）：dshctl use local / dshctl use official"
 }
 
+# ── Docker 部署模式 ──────────────────────────────────────────────────────
+# dshctl docker up|down|restart|status|log|update
+# 与 systemd 双槽位是并行的部署形态：容器对外端口与 systemd 服务相同（默认 3080），
+# 两者同时跑会端口冲突，up/update 前先检测并拒绝。
+docker_usage() {
+    echo "用法：dshctl docker up|down|restart|status|log|update"
+    echo "  up       拉取镜像并启动容器（数据持久化到命名卷，开机自动拉起）"
+    echo "  down     停止并移除容器（数据卷保留，会话与配置不丢）"
+    echo "  restart  重启容器"
+    echo "  status   查看容器状态与应用应答"
+    echo "  log      查看最近容器日志"
+    echo "  update   拉最新镜像并重建容器，新容器起不来时自动回退旧镜像"
+    echo
+    echo "  镜像：$DOCKER_IMAGE（DSHCTL_DOCKER_IMAGE 可覆盖）"
+    echo "  端口：$DOCKER_PORT → 容器 3080（DSHCTL_DOCKER_PORT 可覆盖）"
+    echo "  认证：DSHCTL_DOCKER_AUTH_USER + DSHCTL_DOCKER_AUTH_PASS 同时设置则启用 Basic Auth"
+    return 0
+}
+
+docker_available() {
+    command -v docker >/dev/null 2>&1 || { echo "未找到 docker 命令，请先安装 Docker" >&2; return 1; }
+    docker info >/dev/null 2>&1 || { echo "docker daemon 未运行" >&2; return 1; }
+}
+
+# Basic Auth 凭证只以环境变量传给容器；含空白字符会破坏参数展开，直接拒绝（不猜）。
+# 注意 shell 的 &&/|| 是左结合，配对判断必须显式分组，否则「只设其一」会被绕过。
+docker_validate_auth() {
+    local varname
+    if [ -n "${DSHCTL_DOCKER_AUTH_USER:-}${DSHCTL_DOCKER_AUTH_PASS:-}" ]; then
+        if [ -z "${DSHCTL_DOCKER_AUTH_USER:-}" ] || [ -z "${DSHCTL_DOCKER_AUTH_PASS:-}" ]; then
+            echo "DSHCTL_DOCKER_AUTH_USER 与 DSHCTL_DOCKER_AUTH_PASS 必须同时设置才启用认证（只设一个会被镜像放行所有请求）" >&2
+            return 1
+        fi
+    fi
+    for varname in DSHCTL_DOCKER_AUTH_USER DSHCTL_DOCKER_AUTH_PASS; do
+        case "${!varname:-}" in
+            *[[:space:]]*)
+                echo "$varname 含空白字符，无法安全传参" >&2
+                return 1 ;;
+        esac
+    done
+}
+
+# 用指定镜像（tag 或镜像 ID）启动容器。挂载配置始终由 $DOCKER_IMAGE 名称判断，
+# 与传入镜像解耦——update 回退用旧镜像 ID 重建时挂载保持原样。
+docker_run_container() {
+    local image="$1"
+    local -a run_args=(run -d --name "$DOCKER_CONTAINER" --restart unless-stopped
+        -p "${DOCKER_PORT}:3080"
+        -v "${DOCKER_DATA_VOLUME}:/root/.dsh")
+    case "$DOCKER_IMAGE" in
+        *admin*) run_args+=(-v "${DOCKER_INSTALL_VOLUME}:/opt/dsh") ;;
+    esac
+    if [ -n "${DSHCTL_DOCKER_AUTH_USER:-}" ]; then
+        run_args+=(-e "PROXY_USERNAME=${DSHCTL_DOCKER_AUTH_USER}"
+            -e "PROXY_PASSWORD=${DSHCTL_DOCKER_AUTH_PASS}")
+    fi
+    docker "${run_args[@]}" "$image" >/dev/null
+}
+
+# docker 与 systemd 服务共用对外端口；systemd 服务在跑时直接拒绝，避免起一半失败。
+docker_check_port_conflict() {
+    if systemctl --user is-active --quiet "$UNIT" 2>/dev/null; then
+        echo "systemd 服务 $UNIT 正在运行，与 docker 模式共用端口 $DOCKER_PORT 会冲突。" >&2
+        echo "先停掉其一：dshctl stop（停 systemd 服务，数据保留）" >&2
+        return 1
+    fi
+}
+
+docker_up() {
+    docker_validate_auth || return 1
+    if [ "$(docker container inspect -f '{{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null)" = "running" ]; then
+        echo "容器已在运行：$DOCKER_CONTAINER"
+        docker_status
+        return 0
+    fi
+    docker_check_port_conflict || return 1
+    echo "── 启动 docker 部署 ──"
+    echo "  镜像：$DOCKER_IMAGE"
+    echo "  端口：$DOCKER_PORT（宿主）→ 3080（容器内代理）"
+    echo "  数据：卷 $DOCKER_DATA_VOLUME → /root/.dsh（stop/down 后保留）"
+    if ! spinner "拉取镜像" -- docker pull "$DOCKER_IMAGE"; then
+        return 1
+    fi
+    if ! spinner "启动容器" -- docker_run_container "$DOCKER_IMAGE"; then
+        echo "容器启动失败；若是端口占用，先 dshctl stop 停掉 systemd 服务再试" >&2
+        return 1
+    fi
+    if wait_healthy; then
+        echo "✓ 服务已就绪：$URL"
+        return 0
+    fi
+    echo "⚠ 容器已启动但健康检查未通过，查看日志：dshctl docker log" >&2
+    return 1
+}
+
+docker_down() {
+    if ! docker container inspect "$DOCKER_CONTAINER" >/dev/null 2>&1; then
+        echo "容器不存在：$DOCKER_CONTAINER"
+        return 0
+    fi
+    spinner "停止并移除容器" -- docker rm -f "$DOCKER_CONTAINER" || return 1
+    echo "✓ 已停止（数据卷 $DOCKER_DATA_VOLUME 保留，会话与配置不丢）"
+}
+
+docker_restart() {
+    docker container inspect "$DOCKER_CONTAINER" >/dev/null 2>&1 \
+        || { echo "容器不存在，先执行：dshctl docker up" >&2; return 1; }
+    spinner "重启容器" -- docker restart "$DOCKER_CONTAINER" || return 1
+    if wait_healthy; then
+        echo "✓ 服务已就绪：$URL"
+        return 0
+    fi
+    echo "⚠ 重启后健康检查未通过，查看日志：dshctl docker log" >&2
+    return 1
+}
+
+docker_status() {
+    if ! docker container inspect "$DOCKER_CONTAINER" >/dev/null 2>&1; then
+        echo "容器未创建（docker 模式未部署）。启动：dshctl docker up"
+        return 1
+    fi
+    docker ps -a --filter "name=^$DOCKER_CONTAINER\$" \
+        --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$URL/" 2>/dev/null || true)
+    case "$code" in
+        ""|000) echo "应用应答：无（服务未就绪）" ;;
+        *)      echo "应用应答：HTTP $code（$URL）" ;;
+    esac
+}
+
+docker_log() {
+    docker container inspect "$DOCKER_CONTAINER" >/dev/null 2>&1 \
+        || { echo "容器不存在：$DOCKER_CONTAINER" >&2; return 1; }
+    docker logs --tail 100 "$DOCKER_CONTAINER"
+}
+
+# 拉最新镜像并重建容器。与双槽位预检同一硬约束：新镜像起不来就回退旧镜像，
+# 更新失败不能让服务躺着。
+docker_update() {
+    docker_validate_auth || return 1
+    local old_image new_image
+    old_image=$(docker container inspect -f '{{.Image}}' "$DOCKER_CONTAINER" 2>/dev/null)
+    if ! spinner "拉取最新镜像" -- docker pull "$DOCKER_IMAGE"; then
+        return 1
+    fi
+    new_image=$(docker image inspect -f '{{.Id}}' "$DOCKER_IMAGE" 2>/dev/null)
+    if [ -z "$new_image" ]; then
+        echo "读不到镜像 ID：$DOCKER_IMAGE" >&2
+        return 1
+    fi
+    if [ "$old_image" = "$new_image" ]; then
+        echo "✓ 镜像已是最新：$DOCKER_IMAGE"
+        return 0
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "── [dry-run] 会用新镜像重建容器并重启（去掉 --dry-run 才会真正执行）──"
+        return 0
+    fi
+    echo "  镜像有更新，重建容器（数据卷保留）..."
+    docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
+    if docker_run_container "$DOCKER_IMAGE" && wait_healthy; then
+        echo "✓ 已更新并就绪：$URL"
+        return 0
+    fi
+    echo "  新容器未就绪，回退到上一镜像..." >&2
+    docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
+    if [ -n "$old_image" ] && docker_run_container "$old_image" && wait_healthy; then
+        echo "  已回退到旧镜像，服务恢复运行；新镜像的问题可看：docker logs $DOCKER_CONTAINER" >&2
+    else
+        echo "  ✘ 回退也失败了，手动排查：docker pull $DOCKER_IMAGE && dshctl docker up" >&2
+    fi
+    return 1
+}
+
+do_docker() {
+    local action="${1:-}"
+    docker_available || return 1
+    # docker 模式的健康检查按容器状态 + 实际对外端口判断。
+    DSHCTL_MODE=docker
+    URL="http://127.0.0.1:$DOCKER_PORT"
+    case "$action" in
+        up)      docker_up ;;
+        down)    docker_down ;;
+        restart) docker_restart ;;
+        status)  docker_status ;;
+        log)     docker_log ;;
+        update)  docker_update ;;
+        "" )     docker_usage ;;
+        *)       echo "未知 docker 子命令：$action" >&2; echo; docker_usage; return 2 ;;
+    esac
+}
+
 # ── 交互菜单 ─────────────────────────────────────────────────────────────
 run_menu() {
     menu() {
@@ -963,11 +1177,12 @@ run_menu() {
         echo " 10) 从本地包安装/升级（源码仓库或 tgz 目录）"
         echo " 11) 查看当前运行来源与两个槽位"
         echo " 12) 只切换运行来源（官方包 ↔ 本地槽位）"
+        echo " 13) Docker 部署管理（up/down/status/log/update）"
         echo "  0) 退出"
         echo "-----------------------------------------"
         echo "  也可直接敲：dshctl update [--local 路径] / dshctl use local / dshctl source ..."
         echo "========================================="
-        printf '  请选择 [0-9] 或 10/11/12: '
+        printf '  请选择 [0-9] 或 10/11/12/13: '
     }
     pause() {
         echo
@@ -1001,8 +1216,14 @@ run_menu() {
                     2) use_source local ;;
                     *) echo "  已取消" ;;
                 esac ;;
+            13) printf '  Docker 操作（up/down/restart/status/log/update）: '
+                read -r dact || true
+                case "${dact:-}" in
+                    up|down|restart|status|log|update) do_docker "$dact" ;;
+                    *) docker_available && docker_usage ;;
+                esac ;;
             0) break ;;
-            *) echo "无效选择：$choice（请输入 0-9 或 10/11/12）" ;;
+            *) echo "无效选择：$choice（请输入 0-9 或 10/11/12/13）" ;;
         esac
         pause
     done
@@ -1016,6 +1237,7 @@ show_usage() {
         update|u)     echo "用法：dshctl update [通道|版本] [--local 路径] [--registry] [--dry-run] [--no-restart]" ;;
         use|switch)   echo "用法：dshctl use official|local" ;;
         check|verify) echo "用法：dshctl check [official|local]（只预检能否用当前 profile 启动，不切换、不重启）" ;;
+        docker)       echo "用法：dshctl docker up|down|restart|status|log|update（容器化部署，镜像可用 DSHCTL_DOCKER_IMAGE 覆盖）" ;;
         "" )          ;;
         *)            echo "用法：dshctl $1" ;;
     esac
@@ -1079,6 +1301,7 @@ main() {
         use|switch)       use_source "${2:-}" ;;
         check|verify)     check_slots "${2:-}" ;;
         source|src)       show_source ;;
+        docker)           do_docker "${2:-}" ;;
         status|s)         systemctl --user --no-pager status "$UNIT" ;;
         log|l)            journalctl --user -u "$UNIT" -n 100 --no-pager ;;
         restart|r)        systemctl --user restart "$UNIT" ;;
