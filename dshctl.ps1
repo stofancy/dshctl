@@ -987,8 +987,8 @@ function Invoke-SelfUpdate {
 }
 
 # 首次安装：.\dshctl.ps1 install [--docker]
-# 装 dshctl 自身到 ~\.local\bin、初始化状态目录；不替用户做版本决定
-# （装哪个 dsh 由 upgrade / docker up 完成）。
+# 一条命令交付跑起来的服务：装 dshctl 自身、初始化状态目录，
+# 然后直接完成部署——docker 形态拉镜像起容器，本机形态装官方包并启动。
 function Invoke-InstallCmd {
     param([string]$Mode)
 
@@ -1018,12 +1018,12 @@ function Invoke-InstallCmd {
     New-Item -ItemType Directory -Path (Join-Path $STATE_DIR "logs") -Force | Out-Null
     Write-Success "已就绪：$STATE_DIR"
 
-    Write-Host "── [3/3] 下一步 ──"
+    Write-Host "── [3/3] 部署 ──"
     if ($Mode -in @("--docker", "-d")) {
-        Write-Host "  已选 docker 部署。启动容器：.\dshctl.ps1 docker up"
+        Write-Host "  已选 docker 部署"
+        Invoke-Docker -Action up
     } else {
-        Write-Host "  方式一（本机进程）：.\dshctl.ps1 upgrade latest   # 安装官方包并启动"
-        Write-Host "  方式二（容器）　：.\dshctl.ps1 docker up"
+        Invoke-Upgrade
     }
 }
 

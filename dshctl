@@ -265,8 +265,9 @@ EOF
     systemctl --user daemon-reload
 }
 
-# dshctl install [--docker]：首次安装向导——装 dshctl 自身到 PATH、建服务骨架，
-# 不替用户做版本决定（装哪个 dsh 由 upgrade / docker up 完成）。
+# dshctl install [--docker]：首次安装，一条命令交付跑起来的服务——
+# 装 dshctl 自身到 PATH、建服务骨架，然后直接完成部署：
+# 本机形态装官方包并启动（含预检/切换/重启全流程），docker 形态直接拉镜像起容器。
 do_install_cmd() {
     local mode="${1:-}" self bin_dir bin_prefix
     case "$mode" in
@@ -300,12 +301,11 @@ do_install_cmd() {
             && echo "  ✓ 已生成：$HELP" || return 1
     fi
 
-    echo "── [3/3] 服务骨架 ──"
+    echo "── [3/3] 部署 ──"
     if [ "$mode" = "--docker" ] || [ "$mode" = "-d" ]; then
         echo "  已选 docker 部署，跳过 systemd unit"
-        echo
-        echo "下一步：dshctl docker up"
-        return 0
+        do_docker up
+        return $?
     fi
     if systemctl --user show "$UNIT" -p FragmentPath --value 2>/dev/null | grep -q .; then
         echo "  ✓ unit 已存在：$UNIT"
@@ -319,9 +319,8 @@ do_install_cmd() {
         write_unit_file "$bin_prefix" || return 1
         echo "  ✓ 已生成 unit（ExecStart 指向 $bin_prefix/dsh）"
     fi
-    echo
-    echo "下一步：dshctl upgrade    # 安装/升级官方包 dsh，装完自动重启服务"
-    return 0
+    do_install registry ""
+    return $?
 }
 
 # ── 运行槽位（双槽位切换的唯一开关）──────────────────────────────────────
@@ -1414,7 +1413,18 @@ main() {
             --dry-run|-n|--no-restart) ;;
             --local|-l|--registry|-r)
                 case "${1:-}" in
-                    update|u) ;;
+                    update|u|upgrade|up) ;;
+                    *)
+                        echo "未知参数：$arg" >&2
+                        echo
+                        show_usage "${1:-}"
+                        return 2
+                        ;;
+                esac
+                ;;
+            --docker|-d)
+                case "${1:-}" in
+                    install) ;;
                     *)
                         echo "未知参数：$arg" >&2
                         echo
