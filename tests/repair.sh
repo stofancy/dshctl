@@ -27,6 +27,7 @@ setup() {
     reload_status=0
     restart_status=0
     reset_status=0
+    failed_status=0
     DSHCTL_HEALTH_TRIES=1
 }
 
@@ -40,6 +41,7 @@ systemctl() {
         *FragmentPath*) printf '%s\n' "$UNIT_FILE" ;;
         '--user daemon-reload') return "$reload_status" ;;
         '--user reset-failed '*) return "$reset_status" ;;
+        '--user is-failed --quiet '*) return "$failed_status" ;;
         '--user restart '*) return "$restart_status" ;;
         '--user is-active --quiet '*) return 0 ;;
         *) echo "unexpected systemctl action: $*" >&2; return 99 ;;
@@ -116,9 +118,11 @@ test_missing_package() {
 test_missing_unit() {
     setup missing_unit
     rm "$UNIT_FILE"
-    expect_status 0 main repair --no-restart
+    failed_status=1
+    expect_status 0 main repair
     [ -f "$UNIT_FILE" ]
-    assert_no_call 'restart|reset-failed'
+    assert_no_call 'reset-failed'
+    grep -Fxq -- '--user restart dsh-web.service' "$calls"
 }
 test_linked_unit() {
     setup linked_unit

@@ -333,7 +333,9 @@ repair_service() {
         echo "✓ 启动配置已重建；已按 --no-restart 跳过重启"
         return 0
     fi
-    systemctl --user reset-failed "$UNIT" || return 1
+    if systemctl --user is-failed --quiet "$UNIT"; then
+        systemctl --user reset-failed "$UNIT" || return 1
+    fi
     restart_service
 }
 
