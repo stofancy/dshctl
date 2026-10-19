@@ -34,6 +34,7 @@
 set -u
 
 UNIT="dsh-web.service"
+UNIT_FILE="$HOME/.config/systemd/user/$UNIT"
 URL="http://127.0.0.1:3080"
 HELP="$HOME/.config/dsh-web-help.txt"
 PACKAGE_NAME="@deepseek-ai/dsh"
@@ -232,6 +233,7 @@ dshctl - DeepSeek Harness web 服务管理工具
   dshctl upgrade           升级当前槽位的 dsh（v0.4 前叫 update）
   dshctl update            更新 dshctl 自身
   dshctl install           首次安装：装 dshctl + systemd 服务骨架
+  dshctl repair            备份并重建 systemd 启动配置，保留数据和当前槽位
   dshctl status            查看服务状态
   dshctl restart           重启服务
   dshctl log               查看最近日志
@@ -246,9 +248,11 @@ EOF
 }
 
 write_unit_file() {
-    local unit_dir="$HOME/.config/systemd/user" bin_prefix="$1"
+    local unit_dir bin_prefix="$1" tmp
+    unit_dir=$(dirname "$UNIT_FILE")
     mkdir -p "$unit_dir" || return 1
-    cat > "$unit_dir/$UNIT" <<EOF
+    tmp=$(mktemp "$unit_dir/.dsh-web.XXXXXX") || return 1
+    if ! cat > "$tmp" <<EOF
 [Unit]
 Description=DeepSeek Harness Web (dsh)
 After=network-online.target
@@ -262,7 +266,75 @@ RestartSec=5s
 [Install]
 WantedBy=default.target
 EOF
+    then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 644 "$tmp" || ! mv -f "$tmp" "$UNIT_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
     systemctl --user daemon-reload
+}
+
+# 修复只重建服务配置；安装包由 upgrade 管理。
+repair_service() {
+    if [ "$#" -ne 0 ]; then
+        echo "用法：dshctl repair [--dry-run] [--no-restart]" >&2
+        return 2
+    fi
+    local source prefix bin backup file fragment
+    source=$(current_source)
+    for bin in systemctl npm node; do
+        command -v "$bin" >/dev/null 2>&1 || {
+            echo "修复需要 $bin，请先安装该命令" >&2
+            return 1
+        }
+    done
+    prefix=$(npm prefix -g) || return 1
+    if [ -z "$prefix" ] || [[ "$prefix" != /* ]]; then
+        echo "取不到 npm 全局前缀" >&2
+        return 1
+    fi
+    bin="$prefix/bin/dsh"
+    [ "$source" = local ] && bin="$LOCAL_SLOT/bin/dsh"
+    if [ ! -x "$bin" ]; then
+        echo "当前槽位缺少可执行文件：$bin；请先用 dshctl upgrade 安装该槽位" >&2
+        return 1
+    fi
+
+    echo "修复 $UNIT：重建默认 unit（127.0.0.1:3080），保留 $("${source}_label") 槽位"
+    echo "原 unit 和 dshctl 槽位配置将备份；其他 drop-in、DSH 配置与数据保留。"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "[dry-run] 将备份配置、重建 unit、刷新槽位配置并重新加载 systemd"
+        [ "$RESTART" = 0 ] || echo "[dry-run] 将清除失败状态、重启服务并检查应用应答"
+        return 0
+    fi
+
+    mkdir -p "$STATE_DIR" || return 1
+    backup=$(mktemp -d "$STATE_DIR/service-backup.XXXXXX") || return 1
+    for file in "$UNIT_FILE" "$DROPIN" "$LEGACY_DROPIN"; do
+        if [ -e "$file" ] || [ -L "$file" ]; then
+            cp -Pp "$file" "$backup/" || return 1
+        fi
+    done
+    # 系统级 unit 也可能是当前来源，保留其内容供恢复时参考。
+    fragment=$(systemctl --user show "$UNIT" -p FragmentPath --value 2>/dev/null) || fragment=""
+    if [ -n "$fragment" ] && [ "$fragment" != "$UNIT_FILE" ] && [ -f "$fragment" ]; then
+        cp -p "$fragment" "$backup/loaded-unit.service" || return 1
+    fi
+    echo "原配置备份：$backup"
+    rm -f "$LEGACY_DROPIN" || return 1
+    write_unit_file "$prefix/bin" || return 1
+    if [ "$source" = local ]; then
+        service_bind_local || return 1
+    fi
+    if [ "$RESTART" = 0 ]; then
+        echo "✓ 启动配置已重建；已按 --no-restart 跳过重启"
+        return 0
+    fi
+    systemctl --user reset-failed "$UNIT" || return 1
+    restart_service
 }
 
 # dshctl install [--docker]：首次安装，一条命令交付跑起来的服务——
@@ -1328,11 +1400,12 @@ run_menu() {
         echo " 12) 只切换运行来源（官方包 ↔ 本地槽位）"
         echo " 13) Docker 部署管理（up/down/status/log/update）"
         echo " 14) 更新 dshctl 自身（update）"
+        echo " 15) 修复服务启动配置（repair，原配置先备份）"
         echo "  0) 退出"
         echo "-----------------------------------------"
         echo "  也可直接敲：dshctl upgrade [--local 路径] / dshctl docker up / dshctl update ..."
         echo "========================================="
-        printf '  请选择 [0-9] 或 10-14: '
+        printf '  请选择 [0-9] 或 10-15: '
     }
     pause() {
         echo
@@ -1351,7 +1424,7 @@ run_menu() {
             5) systemctl --user stop "$UNIT" ;;
             6) systemctl --user start "$UNIT" ;;
             7) systemctl --user disable "$UNIT" ;;
-            8) cat "$HELP" ;;
+            8) show_usage ;;
             9) printf '  输入通道名（latest/next/alpha）: '
                read -r tag || true
                [ -n "${tag:-}" ] && do_install registry "$tag" ;;
@@ -1373,8 +1446,9 @@ run_menu() {
                     *) docker_available && docker_usage ;;
                 esac ;;
             14) self_update ;;
+            15) repair_service ;;
             0) break ;;
-            *) echo "无效选择：$choice（请输入 0-9 或 10-14）" ;;
+            *) echo "无效选择：$choice（请输入 0-9 或 10-15）" ;;
         esac
         pause
     done
@@ -1388,13 +1462,20 @@ show_usage() {
         update|u)     echo "用法：dshctl update（更新 dshctl 自身；升级 dsh 请用 dshctl upgrade）" ;;
         upgrade|up)   echo "用法：dshctl upgrade [通道|版本] [--local 路径] [--registry] [--dry-run] [--no-restart]" ;;
         install)      echo "用法：dshctl install [--docker]（首次安装：装 dshctl + 服务骨架）" ;;
+        repair)       echo "用法：dshctl repair [--dry-run] [--no-restart]（备份并重建 systemd 启动配置）" ;;
         use|switch)   echo "用法：dshctl use official|local" ;;
         check|verify) echo "用法：dshctl check [official|local]（只预检能否用当前 profile 启动，不切换、不重启）" ;;
         docker)       echo "用法：dshctl docker up|down|restart|status|log|update（容器化部署，镜像可用 DSHCTL_DOCKER_IMAGE 覆盖）" ;;
         "" )          ;;
         *)            echo "用法：dshctl $1" ;;
     esac
-    [ -f "$HELP" ] && cat "$HELP"
+    if [ -f "$HELP" ]; then
+        cat "$HELP"
+        echo
+        echo "修复启动配置：dshctl repair [--dry-run] [--no-restart]（原配置先备份）"
+    else
+        default_help_text
+    fi
     return 0
 }
 
@@ -1403,7 +1484,12 @@ main() {
     # 帮助优先：命令行里只要有 help / -h / --help，就只打印帮助，绝不执行子命令。
     for arg in "$@"; do
         case "$arg" in
-            help|-h|--help) show_usage "${2:-}"; return 0 ;;
+            help|-h|--help)
+                case "${1:-}" in
+                    help|-h|--help) show_usage "${2:-}" ;;
+                    *) show_usage "$1" ;;
+                esac
+                return 0 ;;
         esac
     done
     # 过程开关之外的「- 开头」参数都算不认识：宁可拒绝执行，也不当普通参数猜。
@@ -1475,6 +1561,7 @@ main() {
                 * )            do_install registry "$2" ;;
             esac ;;
         install)          do_install_cmd "${2:-}" ;;
+        repair)           shift; repair_service "$@" ;;
         update-local|local|ul)
             echo "提示：新版命令是 dshctl upgrade --local（旧写法仍可用）" >&2
             do_install local "${2:-}" ;;

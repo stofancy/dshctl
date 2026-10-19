@@ -294,6 +294,11 @@ dshctl log
 # 重启服务
 dshctl restart
 
+# 修复服务启动配置（仅 Linux/systemd，保留已安装的程序包与 DSH 数据）
+dshctl repair --dry-run       # 先查看修复动作
+dshctl repair                 # 备份配置、重建并重启检查
+dshctl repair --no-restart    # 重建配置，稍后自行重启
+
 # 启动/停止服务
 dshctl start
 dshctl stop
@@ -485,6 +490,9 @@ dshctl 采用契约式设计，每个安装来源实现七个函数：
 ### 测试
 
 ```bash
+# 修复启动配置的隔离回归测试（不操作本机服务）
+bash tests/repair.sh
+
 # 预演模式测试（不实际执行）
 dshctl upgrade --dry-run
 dshctl use local --dry-run
@@ -497,6 +505,20 @@ dshctl check
 ```
 
 ## 故障排查
+
+### 修复服务启动配置（Linux/systemd）
+
+服务 unit 丢失、损坏，或 Node.js/npm 路径变化后，可执行 `dshctl repair`，交互菜单入口为 `15`。
+
+- 将原 unit、dshctl 管理的槽位 drop-in 备份到 `~/.config/dsh/service-backup.*`，运行时输出具体目录。
+- 重建与首次安装相同的基础 unit，官方入口取当前 `npm prefix -g`。基础 unit 中的自定义设置恢复为默认值，包括监听地址 `127.0.0.1:3080`。
+- 保留当前官方／本地槽位；本地槽位的启动配置按当前 Node.js 路径重新生成。清理旧版 dshctl drop-in，保留其他自定义 drop-in。
+- 保留 DSH 配置、会话、已安装的程序包、更新通道和本地制品路径；保留原有开机自启设置。
+- 重新加载 systemd，清除服务失败状态，重启并检查应用应答。`--no-restart` 只重建、加载配置；`--dry-run` 只显示动作。
+
+修复失败会返回非零状态，备份目录保留，供查看或手动恢复原配置。自定义 drop-in 仍会覆盖基础 unit；若故障来自这些文件，需要根据日志修改对应文件。
+
+当前槽位的程序包缺失时，修复会在写入配置前退出；可用 `dshctl upgrade` 安装。Windows 使用进程与 PID 文件管理服务，Docker 使用容器管理，本命令仅用于 systemd 部署。
 
 ### 服务启动失败
 
