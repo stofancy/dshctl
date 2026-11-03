@@ -240,13 +240,37 @@ warn_if_stale() {
 }
 
 # ── dshctl 自身：自更新 ──────────────────────────────────────────────────
+# 拉远端文本。默认走环境里的代理；代理不可达时回退直连再试一次——
+# 代理是否活着，和 GitHub / npm 能不能到，是三件独立的事，不能让它一个坏掉就全废。
+fetch_text() {
+    local url="$1" out proxy
+    out=$(curl -fsSL --max-time 20 "$url" 2>/dev/null) && { printf '%s' "$out"; return 0; }
+    proxy="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
+    [ -n "$proxy" ] && ! proxy_reachable "$proxy" || return 1
+    echo "⚠ 代理不可达：$proxy；本次改为直连" >&2
+    out=$(unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; \
+          curl -fsSL --max-time 20 "$url" 2>/dev/null) || return 1
+    printf '%s' "$out"
+}
+
+# 下载到文件，同样带「代理挂了就直连一次」的回退。
+fetch_file() {
+    local url="$1" dest="$2" proxy
+    curl -fsSL --max-time 60 "$url" -o "$dest" 2>/dev/null && return 0
+    proxy="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
+    [ -n "$proxy" ] && ! proxy_reachable "$proxy" || return 1
+    echo "⚠ 代理不可达：$proxy；本次改为直连" >&2
+    ( unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; \
+      curl -fsSL --max-time 60 "$url" -o "$dest" ) 2>/dev/null
+}
+
 # 从仓库拉最新脚本，校验后原子替换。校验三道：bash 语法必须过、版本号必须是远端
 # VERSION 宣称的那个、下载失败不动原文件——半截脚本绝不能把正在用的 dshctl 换坏。
 self_update() {
     local self tmp remote
     command -v curl >/dev/null 2>&1 || { echo "自更新需要 curl，未做任何改动" >&2; return 1; }
     self=$(readlink -f "${BASH_SOURCE[0]}")
-    remote=$(curl -fsSL --max-time 20 "$DSHCTL_RAW_BASE/VERSION" 2>/dev/null | tr -d '[:space:]')
+    remote=$(fetch_text "$DSHCTL_RAW_BASE/VERSION" | tr -d '[:space:]')
     case "$remote" in
         [0-9]*.[0-9]*.[0-9]*) ;;
         "") echo "取不到远端版本号（网络问题？），未做任何改动" >&2; return 1 ;;
@@ -270,7 +294,7 @@ self_update() {
         return 0
     fi
     tmp=$(mktemp "${TMPDIR:-/tmp}/dshctl-XXXXXX") || return 1
-    if ! curl -fsSL --max-time 60 "$DSHCTL_RAW_BASE/dshctl" -o "$tmp"; then
+    if ! fetch_file "$DSHCTL_RAW_BASE/dshctl" "$tmp"; then
         rm -f "$tmp"
         echo "下载新版失败，未做任何改动" >&2
         return 1
