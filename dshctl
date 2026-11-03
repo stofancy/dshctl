@@ -1,90 +1,68 @@
 #!/usr/bin/env bash
-# dshctl —— dsh web 服务一站式管理 wrapper
-# 把底层 systemctl / journalctl / npm 命令全部包进来。
-# 用法一（傻瓜模式）：直接敲 dshctl 回车，按数字菜单选。
-# 用法二（快捷模式）：dshctl <子命令>，如：
-#   dshctl update [通道|版本]      安装/升级官方包（全局槽位），并按需切换
-#   dshctl update --local [路径]   构建/安装本地包到本地槽位，并按需切换
-#   dshctl use official|local      只切换运行哪个槽位（不重装）
-#   dshctl source                  查看当前运行来源、两个槽位的版本
-#   dshctl update ... --dry-run    预演：只看来源与制品，不安装不切换不重启
-#   dshctl update ... --no-restart 只安装并切换配置，不重启服务
-#   dshctl check [official|local]  预检：用当前 profile 试启目标槽位，不切换不重启
-#   dshctl help                    查看完整说明
+# dshctl —— dsh web 服务的安装、升级与托管
 #
-# 两条硬规则，都是踩过坑之后加的：
-#   1. 命令行里出现 help / -h / --help 就只打印帮助，绝不执行子命令（曾因
-#      `dshctl use official --help` 把 --help 当普通参数吞掉而真的切了槽位）；
-#      其余「- 开头」的未知参数一律拒绝执行，不猜。
-#   2. 切换槽位前先用当前 profile 在临时 DSH_HOME + 空闲端口上试启目标槽位；
-#      起不来就拒绝切换，线上服务一动不动（曾因官方包的 token-meter 不认识
-#      profile 里的 cost 段，切过去后服务直接起不来）。
+# 只管一件事：把官方 npm 包 @deepseek-ai/dsh 装进全局树，并作为 systemd 用户服务跑起来。
+# 没有第二个安装位置，也没有「运行来源」开关：装的就是跑的。
 #
-# 「双槽位」模型：官方包和本地包各自装在自己家里，互不覆盖，dshctl 只决定运行哪一个。
-#   官方槽位（registry）—— 全局 npm 树（npm install -g @deepseek-ai/dsh@<通道或版本>）；
-#   本地槽位（local）   —— 独立 prefix（默认 ~/.local/share/dshctl/slot-local），
-#                          由本地构建的整族 tarball 安装，并把 profile 自带的第三方
-#                          插件（如 dshmarket）并入槽位，保证它也能启动同一个 profile。
-# 运行哪个槽位由 systemd drop-in 决定：
-#   文件不存在 → 跑官方槽位（unit 原本的 ExecStart）；
-#   文件存在   → 跑本地槽位（ExecStart 指向槽位的 bin），删除它即回官方槽位。
-# 切换只是写/删一个 drop-in 再重启，秒级完成；另一个槽位始终完好，随时能切回去继续用。
-# 本地包不写全局 npm 树：对它 npm install -g 会把“不属于本次安装集”的包清掉（曾因此
-# 删掉 dshmarket 等插件、服务起不来）。
+# 用法：
+#   dshctl                     交互菜单
+#   dshctl upgrade [通道|版本]  安装/升级官方包（默认沿用记住的通道）
+#   dshctl install             首次安装：把 dshctl 放进 PATH、写服务单元并完成安装
+#   dshctl status              服务状态 + 已装版本 + 「进程是否还跑着旧代码」
+#   dshctl log                 最近日志
+#   dshctl restart|start|stop  服务控制
+#   dshctl check               预检：已装版本能否用当前 profile 启动（不重启）
+#   dshctl repair              重建 systemd 单元（原配置先备份）
+#   dshctl self-update         更新 dshctl 自身
+#   dshctl help                完整说明
+#   通用开关：--dry-run 只说不做；--no-restart 装完不重启
+#
+# 三条硬规则，都是踩过坑之后加的：
+#   1. 命令行里出现 help / -h / --help 只打印帮助；其余「- 开头」的未知参数一律拒绝
+#      执行，不猜（曾因 `dshctl use official --help` 把 --help 当普通参数吞掉）。
+#   2. 预检必须在正式安装之前跑在暂存件上。全局 npm 树就是正在运行的那份安装，
+#      `npm i -g` 先落地再预检等于拿线上做实验——2026-11-03 实测：rc.2 的进程按需
+#      加载 rc.5 的 text.js，新会话直接报 does not provide an export named 'ownedSlice'。
+#      所以顺序固定为：隔离暂存 → 预检 → 提交 → 重启，重启失败自动装回上一个版本。
+#   3. 预检必须在「不占用线上端口」的前提下跑。profile 可能把监听端口写死
+#      （remote-web-ui 的 lan-bind 块会写 host-webserver.port，配置优先于 --port），
+#      所以临时 DSH_HOME 里也要把那个端口改到空闲端口，否则预检永远 EADDRINUSE。
+#
+# 还有一条不叫规则但体现在输出里：磁盘上的版本比运行中的进程新时必须直说。
+# 那种状态下服务、日志、HTTP 应答全都「正常」，故障只在浏览器里现形。
 set -u
 
 UNIT="dsh-web.service"
 UNIT_FILE="$HOME/.config/systemd/user/$UNIT"
-URL="http://127.0.0.1:3080"
-HELP="$HOME/.config/dsh-web-help.txt"
+HOST="127.0.0.1"
+PORT=3080
+URL="http://$HOST:$PORT"
 PACKAGE_NAME="@deepseek-ai/dsh"
+# 服务单元由 dshctl 生成，固定跑 `dsh web`，端口固定 —— 所以 profile 与端口是常量。
+PROFILE="web"
 
-# dshctl 自身版本与远端基址：update 自更新时对比仓库根的 VERSION 文件。
-# 发版约定：改这里的同时改仓库根 VERSION，两处一致才放行。
-DSHCTL_VERSION="0.4.2"
+
+# 状态：更新通道与「上一个版本」（回滚用）。
+STATE_DIR="$HOME/.config/dsh"
+CHANNEL_FILE="$STATE_DIR/channel"
+PREV_VERSION_FILE="$STATE_DIR/previous-version"
+
+# 已废弃的双槽位模型留下的 drop-in：存在时服务会指向早已没人维护的本地槽位，
+# 启动时清掉（这是一次性迁移，不是功能）。
+LEGACY_DROPIN_DIR="$HOME/.config/systemd/user/$UNIT.d"
+LEGACY_DROPINS="$LEGACY_DROPIN_DIR/50-dshctl-slot.conf $LEGACY_DROPIN_DIR/50-dshctl-source.conf"
+
+# dshctl 自身版本与远端基址：self-update 时对比仓库根的 VERSION 文件。
+DSHCTL_VERSION="0.6.0"
 DSHCTL_RAW_BASE="https://raw.githubusercontent.com/stofancy/dshctl/main"
 
-# 预演开关：由入口的 --dry-run 置 1；只打印将要执行的来源与制品，不安装、不切换、不重启。
+# 过程开关：--dry-run 只打印计划；--no-restart 装完不重启。
 DRY_RUN=0
-# 重启开关：由入口的 --no-restart 置 0；装完不重启（分阶段部署 / 手工安排重启时用）。
 RESTART=1
 
-# ── 状态与槽位 ───────────────────────────────────────────────────────────
-STATE_DIR="$HOME/.config/dsh"
-CHANNEL_FILE="$STATE_DIR/channel"           # 官方槽位的 dist-tag 记忆
-LOCAL_PATH_FILE="$STATE_DIR/local-path"     # 本地槽位的制品来源记忆
-LOCAL_DETAIL_FILE="$STATE_DIR/local-detail" # 本地槽位的制品描述（展示用）
-
-# 本地来源的打包输出目录。源码仓库构建后打包到这里，再交给 npm 安装。
-# 可用 DSHCTL_PACK_DIR 覆盖。
-LOCAL_PACK_DIR="${DSHCTL_PACK_DIR:-$HOME/.cache/dshctl/pack}"
-
-# DSH 源码仓库的默认克隆位置
-DSH_REPO_URL="https://github.com/deepseek-ai/dsh.git"
-DSH_DEFAULT_CLONE_DIR="$HOME/.cache/dshctl/dsh-repo"
-
-# 本地槽位：独立 prefix，与全局 npm 树完全隔离。
-LOCAL_SLOT="${DSHCTL_SLOT_DIR:-$HOME/.local/share/dshctl/slot-local}"
-
-# 拉起本地槽位时 node 要带的 flag。本地构建默认启用 profile 热重载（HMR），
-# 它要求进程带 --expose-internals，而 NODE_OPTIONS 不接受这个 flag，只能直接调 node。
-LOCAL_NODE_FLAGS="${DSHCTL_LOCAL_NODE_FLAGS:---expose-internals}"
-
-# 运行槽位的开关：drop-in 存在 = 跑本地槽位，不存在 = 跑官方槽位。
-# 「当前来源」以它为唯一事实来源，不再单独记状态，手工删改也不会让状态撒谎。
-DROPIN_DIR="$HOME/.config/systemd/user/$UNIT.d"
-DROPIN="$DROPIN_DIR/50-dshctl-slot.conf"
-LEGACY_DROPIN="$DROPIN_DIR/50-dshctl-source.conf"
-
-# ── Docker 部署模式 ──────────────────────────────────────────────────────
-# 第三种部署形态：不装 node、不用 systemd，直接跑现成容器。
-# 官方没有 Docker 镜像，默认用社区镜像 smanx/deepseek-harness（内置反向代理，
-# 解决 DSH 禁止 --host 0.0.0.0 的局域网访问问题）；想换别的镜像用环境变量覆盖。
-DOCKER_IMAGE="${DSHCTL_DOCKER_IMAGE:-smanx/deepseek-harness:latest}"
-DOCKER_CONTAINER="dshctl-dsh-web"
-DOCKER_DATA_VOLUME="dshctl-dsh-data"        # 挂 /root/.dsh，会话与配置持久化
-DOCKER_INSTALL_VOLUME="dshctl-dsh-install"  # 仅 admin 变体镜像需要（挂 /opt/dsh）
-DOCKER_PORT="${DSHCTL_DOCKER_PORT:-3080}"
+# 暂存件的根目录，由 stage_install 填入。用全局变量而不是 stdout 回传，
+# 免得安装过程的提示语混进返回值。
+STAGE_ROOT=""
 
 # ── 状态读写 ─────────────────────────────────────────────────────────────
 # 读取枚举型状态。文件缺失或不可读时输出空串，由调用方决定回退值；
@@ -93,13 +71,6 @@ read_state() {
     local file="$1"
     [ -r "$file" ] || return 0
     tr -d '[:space:]' < "$file" 2>/dev/null
-}
-
-# 读取路径型状态。只去掉行尾换行，保留路径中的空格。
-read_path_state() {
-    local file="$1"
-    [ -r "$file" ] || return 0
-    cat "$file" 2>/dev/null
 }
 
 # 原子写入一行状态：先写临时文件再 mv，避免中断留下截断内容把记忆弄坏。
@@ -115,7 +86,7 @@ write_state() {
 }
 
 # ── 通用工具 ─────────────────────────────────────────────────────────────
-# dist-tag 只认这三个；也允许显式版本号（形如 0.1.5-rc.2）。
+# dist-tag 只认这三个；也允许显式版本号（形如 0.2.1-rc.5）。
 valid_channel() {
     case "$1" in
         latest|next|alpha) return 0 ;;
@@ -124,10 +95,10 @@ valid_channel() {
     esac
 }
 
-# 当前更新通道。记忆文件缺失、为空或含非法值时回落 latest——
-# 否则一个手改坏的值会让此后每次裸 update 都永久失败（写回在安装成功之后，无法自愈）。
+# 当前更新通道。记忆缺失、为空或含非法值时回落 latest——否则一个手改坏的值会让
+# 此后每次裸 upgrade 都永久失败（写回发生在安装成功之后，无法自愈）。
 current_channel() {
-    local c=""
+    local c
     c=$(read_state "$CHANNEL_FILE")
     if [ -n "$c" ] && valid_channel "$c"; then
         printf '%s' "$c"
@@ -137,32 +108,42 @@ current_channel() {
     fi
 }
 
-# 当前实际在跑的 dsh 版本；读不到时报「未知」，不中断流程。
-installed_version() {
-    local bin
-    bin=$(service_bin)
-    if [ -n "$bin" ] && [ -x "$bin" ]; then
-        "$bin" --version 2>/dev/null || echo 未知
-    else
-        echo 未知
-    fi
+# 本次要装的目标：显式通道/版本优先，否则沿用记忆的通道。
+resolve_tag() {
+    printf '%s' "${1:-$(current_channel)}"
 }
 
-# 全局 npm 根目录（官方槽位所在）。惰性求值，避免每条命令都调 npm。
-global_root() {
-    if [ -z "${GLOBAL_ROOT_CACHE:-}" ]; then
-        GLOBAL_ROOT_CACHE="${DSHCTL_GLOBAL_ROOT:-$(npm root -g 2>/dev/null)}"
+# npm 全局前缀（唯一安装位置）。惰性求值并缓存，避免每条命令都调 npm。
+npm_prefix() {
+    if [ -z "${NPM_PREFIX_CACHE:-}" ]; then
+        NPM_PREFIX_CACHE=$(npm prefix -g 2>/dev/null) || NPM_PREFIX_CACHE=""
     fi
-    printf '%s' "$GLOBAL_ROOT_CACHE"
+    [ -n "$NPM_PREFIX_CACHE" ] || return 1
+    printf '%s' "$NPM_PREFIX_CACHE"
+}
+
+# 全局树里的 dsh 入口。装了就是它，没有第二个候选。
+dsh_bin() {
+    local prefix
+    prefix=$(npm_prefix) || return 1
+    printf '%s' "$prefix/bin/dsh"
+}
+
+# 已装版本；读不到时报「未知」，不中断流程。
+installed_version() {
+    local bin
+    bin=$(dsh_bin 2>/dev/null) || { printf '未知'; return 0; }
+    [ -x "$bin" ] || { printf '未安装'; return 0; }
+    "$bin" --version 2>/dev/null || printf '未知'
 }
 
 # 带旋转指示器的后台执行：spinner <描述> -- cmd...
 spinner() {
     local desc="$1"; shift
     [ "$1" = "--" ] && shift
-    local frames='|/-\' i=0
+    local frames='|/-\' i=0 pid rc
     "$@" &
-    local pid=$!
+    pid=$!
     # 非 TTY 或非交互时不画 spinner，只等结果
     if [ ! -t 2 ]; then
         wait "$pid"; return $?
@@ -172,7 +153,7 @@ spinner() {
         printf '\b%c' "${frames:i++%4:1}"
         sleep 0.15
     done
-    wait "$pid"; local rc=$?
+    wait "$pid"; rc=$?
     printf '\b'
     if [ $rc -eq 0 ]; then echo "✔ 完成"
     elif [ $rc -eq 124 ]; then echo "✘ 超时"
@@ -180,10 +161,87 @@ spinner() {
     return $rc
 }
 
-# ── dshctl 自身：更新与安装 ──────────────────────────────────────────────
-# 更新 dshctl 自己（不是 dsh）：从仓库拉最新脚本，校验后原子替换。
-# 校验三道：bash 语法必须过、版本号必须是远端 VERSION 宣称的那个、下载失败不动原文件——
-# 半截脚本或 404 错误页绝不能把正在用的 dshctl 换坏。
+# ── 网络前置检查 ─────────────────────────────────────────────────────────
+# 代理只做 TCP 探测，不依赖 curl。
+proxy_reachable() {
+    local hostport="${1#*://}" host port
+    hostport="${hostport%%/*}"
+    host="${hostport%%:*}"
+    port="${hostport##*:}"
+    [ "$host" != "$port" ] || port=80
+    [ -n "$host" ] || return 1
+    # 连接必须带超时：目标是丢包而不是拒绝时，裸连会一直挂着。
+    timeout 2 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
+}
+
+# npm 失败最容易被误读成「安装失败」的两种根因：代理挂了、镜像还没同步目标版本。
+# 代理不可达时不让它伪装成安装问题：能直连就本次直连，不能直连就明确报错。
+# 这确实会改动本进程的环境变量——dshctl 是一次性进程，且发生在动手安装之前。
+network_precheck() {
+    local proxy registry
+    proxy="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
+    [ -n "$proxy" ] || return 0
+    proxy_reachable "$proxy" && return 0
+    echo "⚠ 代理不可达：$proxy" >&2
+    registry=$(npm config get registry 2>/dev/null || true)
+    [ -n "$registry" ] || registry="https://registry.npmjs.org"
+    if command -v curl >/dev/null 2>&1 && \
+       ( unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; \
+         curl -fsS --max-time 8 -o /dev/null "$registry/" ) 2>/dev/null; then
+        unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+        export no_proxy='*' NO_PROXY='*'
+        echo "  本次直连 $registry（仅影响这次运行）" >&2
+        return 0
+    fi
+    echo "  直连 $registry 也不通：先恢复代理，或换一个可用的 registry，再重试。" >&2
+    return 1
+}
+
+# dist-tag / 版本号 → 确切版本。镜像同步滞后时 dist-tag 已经指过去、版本却还没落地，
+# 这时说清原因，比把 npm 的 ERR 原样糊出来有用。
+npm_view_version() {
+    local tag="$1" out
+    command -v npm >/dev/null 2>&1 || { echo "未找到 npm，无法解析 $tag" >&2; return 1; }
+    if ! out=$(npm view "$PACKAGE_NAME@$tag" version 2>&1); then
+        echo "取不到 $PACKAGE_NAME@$tag 的版本：" >&2
+        printf '%s\n' "$out" | sed 's/^/    /' | head -5 >&2
+        case "$out" in
+            *ECONNREFUSED*|*ENOTFOUND*|*EAI_AGAIN*|*ETIMEDOUT*|*ECONNRESET*)
+                echo "    → 网络或代理问题：先确认 npm 能访问 registry" >&2 ;;
+            *E404*|*404*|*"No matching version"*)
+                echo "    → registry 里没有 $tag；镜像未同步时可稍后重试，或用显式版本号" >&2 ;;
+        esac
+        return 1
+    fi
+    printf '%s' "$(printf '%s\n' "$out" | tail -1 | tr -d '[:space:]')"
+}
+
+# ── 漂移检测 ─────────────────────────────────────────────────────────────
+# 磁盘上的包装得比进程启动还晚 = 进程内存里还是旧代码。这类故障只在浏览器里现形
+# （新会话按需加载新文件，撞上旧进程的模块表），服务状态、日志、HTTP 全是「正常」。
+running_stale() {
+    local prefix pkg installed_epoch started start_epoch
+    prefix=$(npm_prefix) || return 1
+    pkg="$prefix/lib/node_modules/$PACKAGE_NAME/package.json"
+    [ -f "$pkg" ] || return 1
+    installed_epoch=$(stat -c %Y "$pkg" 2>/dev/null) || return 1
+    started=$(systemctl --user show "$UNIT" -p ActiveEnterTimestamp --value 2>/dev/null) || return 1
+    [ -n "$started" ] || return 1
+    start_epoch=$(LC_ALL=C date -d "$started" +%s 2>/dev/null) || return 1
+    [ "$installed_epoch" -gt "$start_epoch" ]
+}
+
+# 只在真的漂移时出声，避免把正常状态说成告警。
+warn_if_stale() {
+    running_stale || return 0
+    echo "⚠ 磁盘上的包比运行中的进程新：进程还跑着旧代码。" >&2
+    echo "  新会话可能因新旧模块混载而失败（例如某些导出不存在）。执行：dshctl restart" >&2
+    return 0
+}
+
+# ── dshctl 自身：自更新 ──────────────────────────────────────────────────
+# 从仓库拉最新脚本，校验后原子替换。校验三道：bash 语法必须过、版本号必须是远端
+# VERSION 宣称的那个、下载失败不动原文件——半截脚本绝不能把正在用的 dshctl 换坏。
 self_update() {
     local self tmp remote
     command -v curl >/dev/null 2>&1 || { echo "自更新需要 curl，未做任何改动" >&2; return 1; }
@@ -197,6 +255,14 @@ self_update() {
     if [ "$remote" = "$DSHCTL_VERSION" ]; then
         echo "✓ dshctl 已是最新（$DSHCTL_VERSION）"
         return 0
+    fi
+    # 远端不高于本地时不要覆盖：本地可能装着还没推上去的修复，
+    # 「版本号不同就覆盖」会把它们悄悄抹掉。
+    if ! printf '%s\n%s\n' "$DSHCTL_VERSION" "$remote" | sort -V -C 2>/dev/null; then
+        echo "远端是 $remote，不比本地 $DSHCTL_VERSION 新；自动覆盖会丢掉本地改动，已跳过。" >&2
+        echo "确实要以远端为准：DSHCTL_FORCE_SELF_UPDATE=1 dshctl self-update" >&2
+        [ "${DSHCTL_FORCE_SELF_UPDATE:-0}" = "1" ] || return 1
+        echo "  已按 DSHCTL_FORCE_SELF_UPDATE=1 继续覆盖" >&2
     fi
     echo "  发现新版本：$DSHCTL_VERSION → $remote"
     if [ "$DRY_RUN" = "1" ]; then
@@ -223,34 +289,13 @@ self_update() {
     echo "✓ dshctl 已更新到 $remote（当前进程仍是旧版，重新运行 dshctl 即生效）"
 }
 
-# 生成 systemd 用户 unit（dsh 本体的服务骨架）。官方包装没装时 ExecStart 指向
-# 未来安装位置（npm 全局 bin），装好后 start 即可跑。
-default_help_text() {
-    cat <<'EOF'
-dshctl - DeepSeek Harness web 服务管理工具
-
-常用命令：
-  dshctl upgrade           升级当前槽位的 dsh（v0.4 前叫 update）
-  dshctl update            更新 dshctl 自身
-  dshctl install           首次安装：装 dshctl + systemd 服务骨架
-  dshctl repair            备份并重建 systemd 启动配置，保留数据和当前槽位
-  dshctl status            查看服务状态
-  dshctl restart           重启服务
-  dshctl log               查看最近日志
-  dshctl source            查看当前运行来源与槽位信息
-  dshctl use <来源>        切换运行来源（official/local）
-  dshctl check             预检槽位是否可用
-  dshctl docker <操作>     Docker 部署管理（up/down/status/log/update）
-  dshctl help              显示帮助信息
-
-无参数运行时进入交互菜单。
-EOF
-}
-
+# ── 服务单元 ─────────────────────────────────────────────────────────────
+# 单元由 dshctl 生成，是「这份安装怎么跑」的唯一事实来源。
 write_unit_file() {
-    local unit_dir bin_prefix="$1" tmp
+    local unit_dir prefix tmp
     unit_dir=$(dirname "$UNIT_FILE")
     mkdir -p "$unit_dir" || return 1
+    prefix=$(npm_prefix) || { echo "取不到 npm 全局前缀" >&2; return 1; }
     tmp=$(mktemp "$unit_dir/.dsh-web.XXXXXX") || return 1
     if ! cat > "$tmp" <<EOF
 [Unit]
@@ -259,7 +304,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$bin_prefix/dsh web --host 127.0.0.1 --port 3080
+ExecStart=$prefix/bin/dsh web --host $HOST --port $PORT
 Restart=on-failure
 RestartSec=5s
 
@@ -277,58 +322,33 @@ EOF
     systemctl --user daemon-reload
 }
 
-# 修复只重建服务配置；安装包由 upgrade 管理。
+# 重建启动配置：只修单元，不碰安装包、不碰数据。
 repair_service() {
+    local backup bin
+    # repair 没有位置参数：多出来的东西一律拒绝，不猜（与"未知参数不执行"同一条原则）。
     if [ "$#" -ne 0 ]; then
         echo "用法：dshctl repair [--dry-run] [--no-restart]" >&2
         return 2
     fi
-    local source prefix bin backup file fragment
-    source=$(current_source)
     for bin in systemctl npm node; do
-        command -v "$bin" >/dev/null 2>&1 || {
-            echo "修复需要 $bin，请先安装该命令" >&2
-            return 1
-        }
+        command -v "$bin" >/dev/null 2>&1 || { echo "修复需要 $bin，请先安装该命令" >&2; return 1; }
     done
-    prefix=$(npm prefix -g) || return 1
-    if [ -z "$prefix" ] || [[ "$prefix" != /* ]]; then
-        echo "取不到 npm 全局前缀" >&2
-        return 1
-    fi
-    bin="$prefix/bin/dsh"
-    [ "$source" = local ] && bin="$LOCAL_SLOT/bin/dsh"
+    bin=$(dsh_bin) || return 1
     if [ ! -x "$bin" ]; then
-        echo "当前槽位缺少可执行文件：$bin；请先用 dshctl upgrade 安装该槽位" >&2
+        echo "还没装：$bin；先跑 dshctl upgrade" >&2
         return 1
     fi
-
-    echo "修复 $UNIT：重建默认 unit（127.0.0.1:3080），保留 $("${source}_label") 槽位"
-    echo "原 unit 和 dshctl 槽位配置将备份；其他 drop-in、DSH 配置与数据保留。"
+    echo "重建 $UNIT（$HOST:$PORT），DSH 配置与数据保留"
     if [ "$DRY_RUN" = 1 ]; then
-        echo "[dry-run] 将备份配置、重建 unit、刷新槽位配置并重新加载 systemd"
-        [ "$RESTART" = 0 ] || echo "[dry-run] 将清除失败状态、重启服务并检查应用应答"
+        echo "[dry-run] 将备份现有单元、重写单元并重新加载 systemd"
+        [ "$RESTART" = 0 ] || echo "[dry-run] 将重启服务并检查应用应答"
         return 0
     fi
-
     mkdir -p "$STATE_DIR" || return 1
     backup=$(mktemp -d "$STATE_DIR/service-backup.XXXXXX") || return 1
-    for file in "$UNIT_FILE" "$DROPIN" "$LEGACY_DROPIN"; do
-        if [ -e "$file" ] || [ -L "$file" ]; then
-            cp -Pp "$file" "$backup/" || return 1
-        fi
-    done
-    # 系统级 unit 也可能是当前来源，保留其内容供恢复时参考。
-    fragment=$(systemctl --user show "$UNIT" -p FragmentPath --value 2>/dev/null) || fragment=""
-    if [ -n "$fragment" ] && [ "$fragment" != "$UNIT_FILE" ] && [ -f "$fragment" ]; then
-        cp -p "$fragment" "$backup/loaded-unit.service" || return 1
-    fi
+    [ -f "$UNIT_FILE" ] && cp -Pp "$UNIT_FILE" "$backup/" 2>/dev/null
     echo "原配置备份：$backup"
-    rm -f "$LEGACY_DROPIN" || return 1
-    write_unit_file "$prefix/bin" || return 1
-    if [ "$source" = local ]; then
-        service_bind_local || return 1
-    fi
+    write_unit_file || return 1
     if [ "$RESTART" = 0 ]; then
         echo "✓ 启动配置已重建；已按 --no-restart 跳过重启"
         return 0
@@ -339,609 +359,19 @@ repair_service() {
     restart_service
 }
 
-# dshctl install [--docker]：首次安装，一条命令交付跑起来的服务——
-# 装 dshctl 自身到 PATH、建服务骨架，然后直接完成部署：
-# 本机形态装官方包并启动（含预检/切换/重启全流程），docker 形态直接拉镜像起容器。
-do_install_cmd() {
-    local mode="${1:-}" self bin_dir bin_prefix
-    case "$mode" in
-        ""|--docker|-d) ;;
-        *) echo "用法：dshctl install [--docker]" >&2; return 2 ;;
-    esac
-
-    self=$(readlink -f "${BASH_SOURCE[0]}")
-    bin_dir="$HOME/.local/bin"
-
-    echo "── [1/3] 安装 dshctl ──"
-    if [ "$(command -v dshctl 2>/dev/null)" = "$self" ]; then
-        echo "  ✓ 已在 PATH：$self"
-    else
-        mkdir -p "$bin_dir" || return 1
-        if [ "$self" != "$bin_dir/dshctl" ]; then
-            cp -f "$self" "$bin_dir/dshctl" && chmod +x "$bin_dir/dshctl" || return 1
-        fi
-        echo "  ✓ 已安装：$bin_dir/dshctl"
-        case ":$PATH:" in
-            *":$bin_dir:"*) ;;
-            *) echo "  ⚠ $bin_dir 不在 PATH，请加入 shell 配置：export PATH=\"$bin_dir:\$PATH\"" ;;
-        esac
-    fi
-
-    echo "── [2/3] 帮助文件 ──"
-    if [ -f "$HELP" ]; then
-        echo "  ✓ 已存在：$HELP"
-    else
-        mkdir -p "$(dirname "$HELP")" && default_help_text > "$HELP" \
-            && echo "  ✓ 已生成：$HELP" || return 1
-    fi
-
-    echo "── [3/3] 部署 ──"
-    if [ "$mode" = "--docker" ] || [ "$mode" = "-d" ]; then
-        echo "  已选 docker 部署，跳过 systemd unit"
-        do_docker up
-        return $?
-    fi
-    if systemctl --user show "$UNIT" -p FragmentPath --value 2>/dev/null | grep -q .; then
-        echo "  ✓ unit 已存在：$UNIT"
-    else
-        if ! command -v npm >/dev/null 2>&1; then
-            echo "  ⚠ 未找到 npm：先装 Node.js 再跑 dshctl install，或改用 docker 部署（dshctl install --docker）" >&2
-            return 1
-        fi
-        bin_prefix=$(npm prefix -g 2>/dev/null)/bin
-        [ -n "${bin_prefix:-}" ] && [ "$bin_prefix" != "/bin" ] || { echo "  取不到 npm 全局前缀" >&2; return 1; }
-        write_unit_file "$bin_prefix" || return 1
-        echo "  ✓ 已生成 unit（ExecStart 指向 $bin_prefix/dsh）"
-    fi
-    do_install registry ""
-    return $?
-}
-
-# ── 运行槽位（双槽位切换的唯一开关）──────────────────────────────────────
-# 切换 = 写/删一个 systemd drop-in + daemon-reload，不碰任何安装内容，
-# 也不需要改用户手写的 unit 文件（参数从 unit 文件原样取用）。
-
-# unit 文件里原始 ExecStart 整行。读 FragmentPath 指向的 unit 文件本身，
-# 而不是 systemctl cat（后者会把我们的 drop-in 也算进来）。
-unit_exec_start() {
-    local fragment start
-    fragment=$(systemctl --user show "$UNIT" -p FragmentPath --value 2>/dev/null)
-    if [ -z "$fragment" ] || [ ! -r "$fragment" ]; then
-        echo "读不到 $UNIT 的 unit 文件（FragmentPath=${fragment:-空}）" >&2
-        return 1
-    fi
-    start=$(sed -n 's/^ExecStart=//p' "$fragment" | head -1)
-    if [ -z "$start" ]; then
-        echo "unit 文件里没有 ExecStart：$fragment" >&2
-        return 1
-    fi
-    printf '%s' "$start"
-}
-
-# 官方槽位的可执行文件（unit 原本 ExecStart 的第一个词）。
-unit_bin() {
-    local start
-    start=$(unit_exec_start 2>/dev/null) || return 0
-    printf '%s' "${start%% *}"
-}
-
-# 原始 ExecStart 里可执行文件之后的参数（原样保留 host/port 等）。
-unit_arguments() {
-    local start
-    start=$(unit_exec_start) || return 1
-    printf '%s' "${start#* }"
-}
-
-# 服务下次启动会用的可执行文件。
-service_bin() {
-    if [ -f "$DROPIN" ]; then
-        printf '%s' "$LOCAL_SLOT/bin/dsh"
-        return 0
-    fi
-    unit_bin
-}
-
-# 把运行槽位指向本地槽位。
-# 用 node 直接拉起槽位入口（而不是槽位的 bin 脚本），因为本地构建的 profile 热重载
-# 需要 --expose-internals，而该 flag 不允许放进 NODE_OPTIONS。
-service_bind_local() {
-    local bin="$LOCAL_SLOT/bin/dsh" entry node args
-    if [ ! -x "$bin" ]; then
-        echo "本地槽位里没有可执行的 dsh：$bin" >&2
-        return 1
-    fi
-    node=$(command -v node 2>/dev/null || true)
-    entry=$(readlink -f "$bin" 2>/dev/null || true)
-    if [ -z "$node" ] || [ -z "$entry" ] || [ ! -f "$entry" ]; then
-        echo "找不到 node（$node）或槽位入口（$entry），无法切换本地槽位" >&2
-        return 1
-    fi
-    args=$(unit_arguments) || return 1
-    mkdir -p "$DROPIN_DIR" || return 1
-    cat > "$DROPIN" <<EOF
-# 由 dshctl 写入：把 dsh-web 指向本地槽位。
-# 删除本文件（或执行 dshctl use official）即回官方槽位。
-[Service]
-ExecStart=
-ExecStart=$node $LOCAL_NODE_FLAGS $entry $args
-EOF
-    systemctl --user daemon-reload
-}
-
-# 把运行槽位交回官方包。
-service_bind_registry() {
-    local changed=0
-    for f in "$DROPIN" "$LEGACY_DROPIN"; do
-        if [ -f "$f" ]; then rm -f "$f"; changed=1; fi
-    done
-    rmdir "$DROPIN_DIR" 2>/dev/null || true
-    [ "$changed" = "1" ] && systemctl --user daemon-reload
-    return 0
-}
-
-# 某个槽位的已装版本，供 show_source 展示。
-slot_version() {
-    local source="$1" bin=""
-    case "$source" in
-        local)    bin="$LOCAL_SLOT/bin/dsh" ;;
-        registry) bin=$(unit_bin) ;;
-    esac
-    if [ -n "$bin" ] && [ -x "$bin" ]; then
-        "$bin" --version 2>/dev/null || echo 未知
-    else
-        echo 未安装
-    fi
-}
-
-# ── 安装来源 ─────────────────────────────────────────────────────────────
-# 每个来源实现七个契约函数，安装主流程只按名字调用（开闭原则）：
-#   <来源>_label             来源的中文名
-#   <来源>_validate <目标>   校验目标；返回 0 合法 / 2 不合法（自行打印原因）
-#   <来源>_describe <目标>   一行描述本次要装什么
-#   <来源>_install  <目标>   执行安装；返回 0 成功 / 非 0 失败
-#   <来源>_remember <目标>   安装成功后写来源记忆并把运行槽位指向它
-#   <来源>_bind              只切换运行槽位（供 dshctl use 与失败回退使用）
-#   <来源>_ready             该槽位是否可用
-#   <来源>_cmd <端口>        该槽位在指定端口的启动命令行（供切换前预检试启）
-# 新增来源 = 实现这七个函数 + 在 SOURCES 登记一个名字，其余流程不动。
-SOURCES="registry local"
-
-source_known() {
-    case " $SOURCES " in
-        *" $1 "*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-# 当前运行来源 = 服务下次启动会跑哪个槽位。事实来源是 drop-in，手工删改也不会撒谎。
-current_source() {
-    if [ -f "$DROPIN" ]; then printf 'local'; else printf 'registry'; fi
-}
-
-# ── 来源：官方 npm 包（全局槽位）─────────────────────────────────────────
-registry_label() { printf '官方包'; }
-
-# 目标标签：显式值优先，否则沿用记忆的通道。
-registry_resolve() {
-    printf '%s' "${1:-$(current_channel)}"
-}
-
-registry_validate() {
-    local tag
-    tag=$(registry_resolve "$1")
-    if ! valid_channel "$tag"; then
-        echo "无效的通道或版本：$tag" >&2
-        echo "可用：latest / next / alpha，或显式版本号（如 0.1.5-rc.2）" >&2
-        return 2
-    fi
-}
-
-registry_describe() {
-    printf '官方包 %s@%s（npm 全局树）' "$PACKAGE_NAME" "$(registry_resolve "$1")"
-}
-
-registry_install() {
-    local tag
-    tag=$(registry_resolve "$1")
-    if ! spinner "npm 全局安装中" -- \
-        npm install -g "$PACKAGE_NAME@$tag" --fetch-timeout=120000 --fetch-retries=3; then
-        return 1
-    fi
-    local installed remote
-    installed=$(slot_version registry)
-    remote=$(npm view "$PACKAGE_NAME@$tag" version 2>/dev/null || true)
-    if [ -n "$remote" ] && [ "$installed" != "$remote" ]; then
-        echo "⚠ 安装后版本为 $installed，与通道 $tag 的 $remote 不一致，请检查" >&2
-    fi
-}
-
-registry_remember() {
-    write_state "$CHANNEL_FILE" "$(registry_resolve "$1")"
-    service_bind_registry
-}
-
-registry_bind() { service_bind_registry; }
-
-registry_ready() {
-    local bin
-    bin=$(unit_bin)
-    [ -n "$bin" ] && [ -x "$bin" ]
-}
-
-# ── 来源：本地包（本地槽位）──────────────────────────────────────────────
-# 目标有三种形态，local_kind 统一识别：
-#   checkout  —— 源码仓库（含 pnpm-workspace.yaml 且定义了 release:pack）：构建并打包；
-#   artifacts —— 已打包目录（顶层有 *.tgz）：直接安装；
-#   tarball   —— 单个 .tgz：只装这一件，其工作区兄弟依赖仍由 npm 从 registry 解析。
-local_label() { printf '本地包'; }
-
-# 本地目标：显式路径优先，否则用记住的路径。
-local_target() {
-    printf '%s' "${1:-$(read_path_state "$LOCAL_PATH_FILE")}"
-}
-
-# 识别本地目标的形态；无法识别时输出空串。
-local_kind() {
-    local path="$1" tarball
-    if [ -f "$path" ]; then
-        case "$path" in
-            *.tgz) printf 'tarball' ;;
-        esac
-        return 0
-    fi
-    [ -d "$path" ] || return 0
-    tarball=$(find "$path" -maxdepth 1 -type f -name '*.tgz' -print -quit 2>/dev/null)
-    if [ -n "$tarball" ]; then
-        printf 'artifacts'
-    elif [ -f "$path/pnpm-workspace.yaml" ] && [ -f "$path/package.json" ] \
-        && grep -q '"release:pack"' "$path/package.json" 2>/dev/null; then
-        printf 'checkout'
-    fi
-}
-
-# 提示用户是否克隆 DSH 源码仓库
-prompt_clone_dsh() {
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
-    echo "⚠️  本地槽位需要 DeepSeek Harness 源码仓库" >&2
-    echo "" >&2
-    echo "本地槽位用于从源码构建 DSH，需要完整的源码仓库。" >&2
-    echo "如果您只是想使用稳定版本，建议使用官方包：" >&2
-    echo "  dshctl update latest" >&2
-    echo "" >&2
-    echo "是否自动克隆 DSH 源码仓库到：" >&2
-    echo "  $DSH_DEFAULT_CLONE_DIR" >&2
-    echo "" >&2
-    echo "仓库地址：$DSH_REPO_URL" >&2
-    echo "克隆大小：约 100MB，首次构建需要数分钟" >&2
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
-    printf '是否继续克隆？[y/N]: ' >&2
-    
-    # 非交互环境直接拒绝
-    if [ ! -t 0 ]; then
-        echo "N (非交互环境，已拒绝)" >&2
-        return 1
-    fi
-    
-    local answer
-    read -r answer || return 1
-    case "${answer,,}" in
-        y|yes|是) return 0 ;;
-        *) 
-            echo "" >&2
-            echo "已取消。建议使用官方包：dshctl update latest" >&2
-            return 1 ;;
-    esac
-}
-
-# 克隆 DSH 源码仓库
-clone_dsh_repo() {
-    local target="$DSH_DEFAULT_CLONE_DIR"
-    
-    if [ -d "$target" ]; then
-        echo "  目标目录已存在：$target" >&2
-        if [ -d "$target/.git" ]; then
-            echo "  检测到已有 git 仓库，尝试更新..." >&2
-            if git -C "$target" pull --ff-only 2>/dev/null; then
-                echo "  ✓ 已更新到最新版本" >&2
-                return 0
-            else
-                echo "  ⚠ 更新失败，将使用现有版本" >&2
-                return 0
-            fi
-        fi
-    fi
-    
-    echo "  开始克隆 DSH 源码仓库..." >&2
-    echo "  仓库：$DSH_REPO_URL" >&2
-    echo "  目标：$target" >&2
-    
-    if ! command -v git >/dev/null 2>&1; then
-        echo "  ✘ 未找到 git 命令，无法克隆仓库" >&2
-        return 1
-    fi
-    
-    mkdir -p "$(dirname "$target")" || return 1
-    
-    if spinner "克隆中（可能需要数分钟）" -- \
-        git clone --depth 1 "$DSH_REPO_URL" "$target"; then
-        echo "  ✓ 克隆完成：$target" >&2
-        return 0
-    else
-        echo "  ✘ 克隆失败" >&2
-        rm -rf "$target"
-        return 1
-    fi
-}
-
-local_validate() {
-    local target kind
-    target=$(local_target "$1")
-    
-    # 未指定路径且没有记忆：提示是否克隆
-    if [ -z "$target" ]; then
-        if ! prompt_clone_dsh; then
-            return 2
-        fi
-        if ! clone_dsh_repo; then
-            echo "" >&2
-            echo "克隆失败。您也可以手动克隆后再试：" >&2
-            echo "  git clone $DSH_REPO_URL /path/to/dsh" >&2
-            echo "  dshctl update --local /path/to/dsh" >&2
-            return 2
-        fi
-        target="$DSH_DEFAULT_CLONE_DIR"
-        # 更新 local_target 的返回值，让后续流程使用克隆的路径
-        write_state "$LOCAL_PATH_FILE" "$target"
-    fi
-    
-    if [ ! -e "$target" ]; then
-        echo "本地路径不存在：$target" >&2
-        return 2
-    fi
-    kind=$(local_kind "$target")
-    if [ -z "$kind" ]; then
-        echo "无法识别的本地路径：$target" >&2
-        echo "需要源码仓库（含 pnpm-workspace.yaml 与 release:pack 脚本）、含 *.tgz 的目录，或 .tgz 文件。" >&2
-        return 2
-    fi
-}
-
-# 收集待安装的 tarball：文件就是它自己，目录取顶层 *.tgz。
-collect_tarballs() {
-    local item
-    for item in "$@"; do
-        if [ -f "$item" ]; then
-            printf '%s\n' "$item"
-        elif [ -d "$item" ]; then
-            find "$item" -maxdepth 1 -type f -name '*.tgz' | sort
-        fi
-    done
-}
-
-local_tarball_count() {
-    collect_tarballs "$1" | wc -l | tr -d '[:space:]'
-}
-
-local_describe() {
-    local target kind
-    target=$(local_target "$1")
-    kind=$(local_kind "$target")
-    case "$kind" in
-        checkout)  printf '本地源码 %s（build:official 构建 + release:pack 打包 → 本地槽位）' "$target" ;;
-        artifacts) printf '本地制品目录 %s（%s 个 tarball → 本地槽位）' "$target" "$(local_tarball_count "$target")" ;;
-        tarball)   printf '本地 tarball %s（单个制品 → 本地槽位）' "$target" ;;
-        *)         printf '本地 %s' "$target" ;;
-    esac
-}
-
-# 源码仓库：完整官方构建 + 两族打包到 LOCAL_PACK_DIR。
-# vendor 与 dsh 各自打包到子目录，因为 pack.ts 会先清空自己的输出目录。
-local_pack_checkout() {
-    local repo="$1" out="$LOCAL_PACK_DIR"
-    echo "  构建 $repo（native + lib + web，可能需要数分钟）"
-    if ! spinner "构建中" -- pnpm --dir "$repo" run build:official; then
-        return 1
-    fi
-    if ! spinner "打包 vendor 族" -- \
-        pnpm --dir "$repo" run release:pack --family vendor --out "$out/vendor"; then
-        return 1
-    fi
-    if ! spinner "打包 dsh 族" -- \
-        pnpm --dir "$repo" run release:pack --family dsh --out "$out/dsh"; then
-        return 1
-    fi
-}
-
-# 把两族 tarball 汇总到一个平坦目录：安装只认一个目录，
-# 同时留下「跳过构建、直接重装同一批制品」的入口。
-local_flatten_artifacts() {
-    local out="$1" flat tarball
-    flat="$out/artifacts"
-    rm -rf "$flat"
-    mkdir -p "$flat" || return 1
-    while IFS= read -r tarball; do
-        cp -f "$tarball" "$flat/" || return 1
-    done < <(collect_tarballs "$out/vendor" "$out/dsh")
-    printf '%s\n' "$flat"
-}
-
-# profile 自己声明的第三方 bundle（不在整族包里的，例如 dshmarket）必须也能从槽位解析，
-# 否则槽位启动时报 Cannot find package <plugin>。它们本就住在 profile 项目里，故软链过去。
-profile_bundle_names() {
-    node -e 'const m=require(process.argv[1]);for(const b of m.dsh?.profile?.bundles??[])console.log(b)' "$1" 2>/dev/null
-}
-
-link_profile_plugins() {
-    local modules="$LOCAL_SLOT/lib/node_modules" profile name src linked=0
-    for profile in "$HOME"/.dsh/profiles/*; do
-        [ -f "$profile/package.json" ] || continue
-        while IFS= read -r name; do
-            [ -n "$name" ] || continue
-            [ -e "$modules/$name" ] && continue
-            src="$profile/node_modules/$name"
-            [ -d "$src" ] || continue
-            mkdir -p "$(dirname "$modules/$name")" || return 1
-            ln -sfn "$src" "$modules/$name" || return 1
-            linked=$((linked + 1))
-        done < <(profile_bundle_names "$profile/package.json")
-    done
-    echo "  已并入 profile 自带插件 $linked 个（软链到 profile 自己的安装）"
-}
-
-local_install() {
-    local target kind
-    target=$(local_target "$1")
-    kind=$(local_kind "$target")
-
-    local -a sources=()
-    case "$kind" in
-        checkout)
-            local_pack_checkout "$target" || return 1
-            local flat
-            flat=$(local_flatten_artifacts "$LOCAL_PACK_DIR") || return 1
-            echo "  制品目录：$flat（之后可用 dshctl update --local $flat 跳过构建直接重装）"
-            sources=("$flat")
-            ;;
-        artifacts) sources=("$target") ;;
-        tarball)   sources=("$target") ;;
-    esac
-
-    local -a tarballs=()
-    mapfile -t tarballs < <(collect_tarballs "${sources[@]}")
-    if [ "${#tarballs[@]}" -eq 0 ]; then
-        echo "  未找到任何 .tgz 制品：${sources[*]}" >&2
-        return 1
-    fi
-    echo "  制品：${#tarballs[@]} 个 tarball（本地构建的整族包）"
-    echo "  装入本地槽位：$LOCAL_SLOT（与全局 npm 树完全隔离，不动正在运行的服务）"
-    if ! spinner "npm 安装中" -- \
-        npm install -g --prefix "$LOCAL_SLOT" --no-audit --no-fund \
-        --fetch-timeout=120000 --fetch-retries=3 "${tarballs[@]}"; then
-        return 1
-    fi
-    link_profile_plugins || return 1
-    # 切换运行槽位之前先冒烟：装坏的本地包绝不能带下水。
-    local version
-    if ! version=$("$LOCAL_SLOT/bin/dsh" --version 2>/dev/null); then
-        echo "  本地槽位自检失败（$LOCAL_SLOT/bin/dsh --version 未通过），保持当前来源不变" >&2
-        return 1
-    fi
-    echo "  本地槽位自检通过：dsh --version = $version"
-}
-
-local_remember() {
-    local target kind detail commit
-    target=$(local_target "$1")
-    kind=$(local_kind "$target")
-    detail="$kind @ $(date '+%Y-%m-%d %H:%M')"
-    if [ "$kind" = "checkout" ]; then
-        commit=$(git -C "$target" rev-parse --short HEAD 2>/dev/null)
-        [ -n "$commit" ] && detail="$detail commit $commit"
-    fi
-    write_state "$LOCAL_PATH_FILE" "$target"
-    write_state "$LOCAL_DETAIL_FILE" "$detail"
-    service_bind_local
-}
-
-local_bind() { service_bind_local; }
-
-local_ready() {
-    local bin="$LOCAL_SLOT/bin/dsh"
-    [ -x "$bin" ] && "$bin" --version >/dev/null 2>&1
-}
-
-# ── 安装主流程 ───────────────────────────────────────────────────────────
-do_install() {
-    local source="$1" target="${2:-}"
-    if ! source_known "$source"; then
-        echo "未知安装来源：$source（可用：$SOURCES）" >&2
-        return 2
-    fi
-    local validate="${source}_validate" describe="${source}_describe"
-    local install="${source}_install" remember="${source}_remember"
-
-    "$validate" "$target" || return $?
-
-    echo "── [1/4] 目标 ──"
-    echo "  来源：$("${source}_label")"
-    echo "  内容：$("$describe" "$target")"
-    echo "  当前运行：$("$(current_source)"_label)"
-
-    if [ "$DRY_RUN" = "1" ]; then
-        echo "── [dry-run] 跳过安装、切换与重启（去掉 --dry-run 才会真正执行）──"
-        return 0
-    fi
-
-    local previous
-    previous=$(current_source)
-
-    echo "── [2/4] 安装 ──"
-    if ! "$install" "$target"; then
-        echo "安装失败：安装未成功，运行来源保持 $("${previous}_label")。" >&2
-        return 1
-    fi
-
-    echo "── [3/4] 切换前预检 ──"
-    if ! preflight_slot "$source"; then
-        echo "预检未通过：$("${source}_label") 装上了但用当前 profile 起不来；运行来源保持 $("${previous}_label")，未切换。" >&2
-        return 1
-    fi
-
-    echo "── [4/4] 切换槽位 ──"
-    if ! "$remember" "$target"; then
-        echo "切换失败：运行来源保持 $("${previous}_label")。" >&2
-        return 1
-    fi
-    if [ "$previous" != "$source" ]; then
-        echo "  运行来源：$("${previous}_label") → $("${source}_label")"
-    fi
-
-    if [ "$RESTART" = "0" ]; then
-        echo "── 已按 --no-restart 跳过重启；下次启动用 $("${source}_label") ──"
-        return 0
-    fi
-
-    restart_checked "$previous"
-}
-
-# 重启并确认服务真的起来了；起不来就切回上一个来源再重启一次——
-# 「一个槽位坏了也不能让线上服务躺着」是这条路径的硬约束。
-restart_checked() {
-    local fallback="${1:-}"
-    restart_service && return 0
-    if [ -n "$fallback" ] && [ "$fallback" != "$(current_source)" ] \
-        && source_known "$fallback" && "${fallback}_ready"; then
-        echo "  服务未起来，切回 $("${fallback}_label")…" >&2
-        if "${fallback}_bind" && restart_service; then
-            echo "  已切回 $("${fallback}_label")，服务恢复运行；可用 dshctl source 查看" >&2
-        fi
-    fi
-    return 1
-}
-
-# 服务进程是否在运行：systemd 模式看 unit 状态，docker 模式看容器状态。
-# 由 do_docker 入口设置 DSHCTL_MODE=docker，其余路径默认 systemd。
-service_alive() {
-    if [ "${DSHCTL_MODE:-systemd}" = "docker" ]; then
-        [ "$(docker container inspect -f '{{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null)" = "running" ]
-    else
-        systemctl --user is-active --quiet "$UNIT"
-    fi
-}
-
+# ── 服务控制 ─────────────────────────────────────────────────────────────
 # 等待服务真正可用：进程 active，且根路径给出应用级应答（认证重定向 3xx 或 401）。
-# 连不上、404、5xx 都算没起来——实测本地槽位缺 node flag 时正是先 404 再崩，
-# 只看 systemctl is-active 会漏判（进程起来一秒后照样退出）。
+# 连不上、404、5xx 都算没起来——只看 systemctl is-active 会漏判「起来一秒就崩」。
 wait_healthy() {
-    local i code
+    local i code tries
     if ! command -v curl >/dev/null 2>&1; then
         sleep 3
-        service_alive
+        systemctl --user is-active --quiet "$UNIT"
         return $?
     fi
-    local tries="${DSHCTL_HEALTH_TRIES:-30}"
+    tries="${DSHCTL_HEALTH_TRIES:-30}"
     for i in $(seq 1 "$tries"); do
-        if service_alive; then
+        if systemctl --user is-active --quiet "$UNIT"; then
             code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$URL/" 2>/dev/null || true)
             case "$code" in
                 ""|000|404|5*) : ;;
@@ -966,39 +396,91 @@ restart_service() {
     return 1
 }
 
-# ── 预检：目标槽位能不能用当前 profile 启动 ──────────────────────────────
-# 槽位里那份 dsh 是否认识当前 profile 的配置段，只有真正加载一次插件树才知道
-# （官方包的 token-meter 没有 cost 段，切过去后服务直接起不来）。所以切换前先
-# 在临时 DSH_HOME + 空闲端口上试启一次：失败就拒绝切换，线上服务一动不动。
-PREFLIGHT_TRIES="${DSHCTL_PREFLIGHT_TRIES:-25}"
-
-# 目标槽位在指定端口上的启动命令行，和线上那条同源：官方槽位用 unit 原本的 ExecStart
-# （只换端口、加 --no-open），本地槽位用 service_bind_local 写的 node + flags + 槽位入口。
-registry_cmd() {
-    local port="$1" args
-    args=$(unit_arguments) || return 1
-    printf '%s %s --no-open' "$(unit_bin)" "$(printf '%s' "$args" | sed -E "s/--port [0-9]+/--port $port/")"
-}
-local_cmd() {
-    local port="$1" node entry
-    node=$(command -v node 2>/dev/null || true)
-    entry=$(readlink -f "$LOCAL_SLOT/bin/dsh" 2>/dev/null || true)
-    if [ -z "$node" ] || [ -z "$entry" ] || [ ! -f "$entry" ]; then
+# 重启失败就装回上一个版本再重启：一个坏制品不能让线上服务躺着。
+restart_checked() {
+    restart_service && return 0
+    echo "  服务未起来，尝试装回上一个版本…" >&2
+    if ! rollback_install; then
+        echo "  ✘ 没有可回滚的版本，查看日志：dshctl log" >&2
         return 1
     fi
-    printf '%s %s %s web --host 127.0.0.1 --port %s --no-open' "$node" "$LOCAL_NODE_FLAGS" "$entry" "$port"
+    if restart_service; then
+        echo "  已回滚到 $(installed_version)，服务恢复运行" >&2
+    else
+        echo "  ✘ 回滚后服务仍未起来，查看日志：dshctl log" >&2
+    fi
+    return 1
 }
 
+# ── 安装事务：暂存 / 提交 / 回滚 ─────────────────────────────────────────
+# 暂存：把确切版本装进隔离 prefix，全局树在这一步一行都不动。这样「预检失败」
+# 才真的等于「线上什么都没变」，也不会留下装了一半的中间态。
+stage_install() {
+    local want="$1" root got
+    root=$(mktemp -d "${TMPDIR:-/tmp}/dshctl-stage-XXXXXX") || return 1
+    if ! spinner "暂存安装（隔离 prefix，不动全局树）" -- \
+        npm install -g --prefix "$root" --no-audit --no-fund --prefer-offline \
+        --fetch-timeout=120000 --fetch-retries=3 "$PACKAGE_NAME@$want"; then
+        rm -rf "$root"
+        return 1
+    fi
+    got=$("$root/bin/dsh" --version 2>/dev/null || true)
+    if [ "$got" != "$want" ]; then
+        echo "  暂存件版本异常：装到 ${got:-空}，目标是 $want" >&2
+        rm -rf "$root"
+        return 1
+    fi
+    STAGE_ROOT="$root"
+}
+
+# 提交：把已验证的确切版本装进全局树。装之前记下当前版本，服务起不来时才能退回去。
+commit_install() {
+    local want="$1" prev="$2" got
+    case "$prev" in
+        *[0-9]*) write_state "$PREV_VERSION_FILE" "$prev" ;;
+        *)       echo "  ⚠ 读不到当前版本，本次提交无法回滚" >&2 ;;
+    esac
+    if ! spinner "提交到全局 npm 树" -- \
+        npm install -g --no-audit --no-fund --prefer-offline \
+        --fetch-timeout=120000 --fetch-retries=3 "$PACKAGE_NAME@$want"; then
+        return 1
+    fi
+    got=$(installed_version)
+    if [ "$got" != "$want" ]; then
+        echo "  提交后版本为 $got，预期 $want" >&2
+        return 1
+    fi
+    echo "  全局树：$PACKAGE_NAME@$want"
+}
+
+rollback_install() {
+    local prev
+    prev=$(read_state "$PREV_VERSION_FILE")
+    case "$prev" in *[0-9]*) ;; *) echo "  没有记录上一个版本，无法回滚" >&2; return 1 ;; esac
+    echo "  回滚全局树到 $prev…" >&2
+    spinner "回滚中" -- npm install -g --no-audit --no-fund --prefer-offline \
+        --fetch-timeout=120000 --fetch-retries=3 "$PACKAGE_NAME@$prev" || return 1
+    [ "$(installed_version)" = "$prev" ]
+}
+
+# ── 预检：这份安装能不能用当前 profile 启动 ──────────────────────────────
+# 那份 dsh 是否认识 profile 的配置段，只有真正加载一次插件树才知道。
+# 预检跑在暂存件上：正式安装就是全局树，先装再验等于拿线上做实验。
+PREFLIGHT_TRIES="${DSHCTL_PREFLIGHT_TRIES:-25}"
+
 # 试启用端口；只用 bash 的 /dev/tcp 探测，不依赖 ss / netstat。
+# 试启用的空闲端口：让 node 绑一个临时端口再释放，由内核保证它是空的。
+# 不能用「连不上就当作空闲」：这台机器的 WSL 对未监听端口不返回 RST 而是直接丢包，
+# /dev/tcp 探测会一直挂着（实测 3091..3120 全部 hang），预检第一步就卡死。
 preflight_free_port() {
     local port
-    for port in $(seq "${DSHCTL_PREFLIGHT_PORT:-3091}" 3120); do
-        if ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
-            printf '%s' "$port"
-            return 0
-        fi
-    done
-    return 1
+    port=$(node -e '
+        const s = require("net").createServer();
+        s.on("error", () => process.exit(1));
+        s.listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close(); });
+    ' 2>/dev/null) || return 1
+    case "$port" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$port"
 }
 
 # 打印试启日志里最能说明问题的那几行。
@@ -1023,372 +505,281 @@ preflight_cleanup() {
     return 0
 }
 
-# 用当前 profile 试启目标槽位。返回 0 = 给出应用级应答；1 = 起不来（原因打到 stderr）。
-preflight_slot() {
-    local source="$1" home log port pid i code item
-    # 自测与应急的显式逃生门：关掉预检会有服务起不来的风险，因此跳过时照样出声。
-    if [ "${DSHCTL_PREFLIGHT:-1}" = "0" ]; then
-        echo "  预检已跳过（DSHCTL_PREFLIGHT=0）"
-        return 0
-    fi
+# 试启用 DSH_HOME：只带启动判定需要的部分（插件树与 profile 才是判据）。
+# profile 可能把监听端口写死——remote-web-ui 的 lan-bind 块会往 cordis.patch.yml 写
+# host-webserver.port，而配置里的端口优先于命令行 --port。不把这处也改到空闲端口，
+# 试启就会和线上服务抢同一个端口：预检永远 EADDRINUSE，还会被误报成「装的东西起不来」。
+preflight_prepare_home() {
+    local want_port="$1" home item link original resolved f changed=0
     home=$(mktemp -d "${TMPDIR:-/tmp}/dsh-preflight-XXXXXX") || return 1
-    # 只带启动判定需要的部分：插件树与 profile 才是判据，会话与附件不必进场。
     for item in profiles settings.yaml AGENTS.md; do
         [ -e "$HOME/.dsh/$item" ] && cp -a "$HOME/.dsh/$item" "$home/" 2>/dev/null
     done
-    log="$home/preflight.log"
-    if ! port=$(preflight_free_port); then
-        echo "  预检：找不到空闲端口" >&2
-        preflight_cleanup "$home" ""
-        return 1
+    if [ -d "$home/profiles" ]; then
+        # 临时副本中的外部相对软链接需要指向原来的有效目标。
+        while IFS= read -r -d '' link; do
+            [ -e "$link" ] && continue
+            original="$HOME/.dsh/${link#"$home/"}"
+            resolved=$(readlink -e "$original") || continue
+            ln -sfn "$resolved" "$link"
+        done < <(find "$home/profiles" -type l -print0)
     fi
-    # 命令行按空格切成 argv：这里的路径（node、槽位）都不含空格，与 dshctl 其余部分同假设。
-    local -a cmd=()
-    if ! read -r -a cmd <<< "$("${source}_cmd" "$port")" || [ "${#cmd[@]}" -lt 2 ]; then
-        echo "  预检：无法构造 $("${source}_label") 的启动命令" >&2
-        preflight_cleanup "$home" ""
-        return 1
+    if [ "$want_port" != "$PORT" ] && [ -d "$home/profiles" ]; then
+        for f in "$home"/profiles/*/cordis*.yml; do
+            [ -f "$f" ] || continue
+            grep -qE "^[[:space:]]*port:[[:space:]]*$PORT[[:space:]]*$" "$f" 2>/dev/null || continue
+            sed -i -E "s/^([[:space:]]*port:[[:space:]]*)$PORT([[:space:]]*)$/\1$want_port\2/" "$f"
+            changed=$((changed + 1))
+        done
     fi
-    DSH_HOME="$home" setsid "${cmd[@]}" >"$log" 2>&1 &
-    pid=$!
-    for i in $(seq 1 "$PREFLIGHT_TRIES"); do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            echo "  预检失败：$("${source}_label") 启动即退出" >&2
-            preflight_report "$log"
-            preflight_cleanup "$home" "$pid"
-            return 1
+    if [ "$changed" -gt 0 ]; then
+        echo "  试启用临时 home：profile 写死的端口 $PORT 已改到 $want_port（仅副本）" >&2
+    fi
+    printf '%s' "$home"
+}
+
+# profile 里精确钉死的 @deepseek-ai/* 必须与目标核心同版本：这类错配只在浏览器里
+# 现形（插件客户端 entry 激活失败），服务端 HTTP 应答完全正常，所以要在起服务之前拦下。
+# 判据两条：声明的精确版本等于目标；实装版本等于声明（改了声明没 pnpm install 也算错配）。
+# 只看服务真正加载的那个 profile；也不能拿 profile 里所有 @deepseek-ai/* 跟核心比——
+# cosmokit、schemastery 也在同一个 scope 下但版本独立，全比会稳定误报。
+profile_pin_check() {
+    local target="$1" pkg name version pinned installed bad=0
+    case "$target" in [0-9]*.[0-9]*.[0-9]*) ;; *) return 0 ;; esac
+    if [ "${DSHCTL_SKIP_PROFILE_PIN_CHECK:-0}" = "1" ]; then
+        echo "  profile 版本守卫已跳过（DSHCTL_SKIP_PROFILE_PIN_CHECK=1）"
+        return 0
+    fi
+    pkg="$HOME/.dsh/profiles/$PROFILE/package.json"
+    [ -f "$pkg" ] || return 0
+    while IFS=$'\t' read -r name version; do
+        [ -n "$name" ] || continue
+        pinned="${version#[\^~]}"
+        [ "$pinned" = "$version" ] || continue
+        case "$pinned" in [0-9]*.[0-9]*.[0-9]*) ;; *) continue ;; esac
+        if [ "$pinned" != "$target" ]; then
+            printf '  profile 版本错配：%s 声明 %s=%s，目标核心 %s\n' "$PROFILE" "$name" "$version" "$target" >&2
+            bad=1
         fi
-        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$port/" 2>/dev/null || true)
-        case "$code" in
-            401|303|200)
-                # 应答之后再确认进程还活着：起一秒就崩的槽位会在这里现形（只看一次应答会误判）。
-                sleep 1
-                if kill -0 "$pid" 2>/dev/null; then
-                    echo "  预检通过：$("${source}_label") 能用当前 profile 启动"
-                    preflight_cleanup "$home" "$pid"
-                    return 0
-                fi
-                echo "  预检失败：$("${source}_label") 应答之后又退出了" >&2
-                preflight_report "$log"
-                preflight_cleanup "$home" "$pid"
-                return 1
-                ;;
-        esac
-        sleep 1
-    done
-    echo "  预检失败：$("${source}_label") 在 ${PREFLIGHT_TRIES}s 内没有给出应用级应答" >&2
+        installed=$(node -p "try{require(process.argv[1]).version}catch(e){''}" \
+            "$HOME/.dsh/profiles/$PROFILE/node_modules/$name/package.json" 2>/dev/null)
+        if [ -n "$installed" ] && [ "$installed" != "$pinned" ]; then
+            printf '  profile 安装未对齐：%s 的 %s 声明 %s、实装 %s（先在该 profile 目录 pnpm install）\n' \
+                "$PROFILE" "$name" "$pinned" "$installed" >&2
+            bad=1
+        fi
+    done < <(node -e 'const p=require(process.argv[1]);for(const [n,v] of Object.entries(p.dependencies??{}))if(n.startsWith("@deepseek-ai/")&&typeof v==="string")console.log(n+"\t"+v)' "$pkg" 2>/dev/null)
+    if [ "$bad" = "1" ]; then
+        printf '  预检失败：profile %s 里精确钉死的 @deepseek-ai/* 与目标核心 %s 不一致。\n' "$PROFILE" "$target" >&2
+        printf '  在 %s/.dsh/profiles/%s 里把它们对齐到 %s 并 pnpm install，再重试。\n' \
+            "$HOME" "$PROFILE" "$target" >&2
+        echo "  （不推荐跳过：DSHCTL_SKIP_PROFILE_PIN_CHECK=1）" >&2
+        return 1
+    fi
+    return 0
+}
+
+# 预检失败输出：把「制品坏了」和「试启环境撞车」分开说，否则用户会去找不存在的问题。
+preflight_fail() {
+    local home="$1" pid="$2" reason="$3" log="$1/preflight.log"
+    echo "  预检失败：$reason" >&2
+    if grep -qE 'EADDRINUSE' "$log" 2>/dev/null; then
+        echo "    注意：这是端口被占用，属于试启环境冲突，不代表装的东西坏了。" >&2
+        echo "    排查：grep -rn 'port:' $HOME/.dsh/profiles/*/cordis*.yml" >&2
+    fi
     preflight_report "$log"
     preflight_cleanup "$home" "$pid"
     return 1
 }
 
-# 只预检：dshctl check [official|local]（默认两个都试），不切换、不重启。
-check_slots() {
-    local want="${1:-}" source failed=0
-    local -a list=()
-    case "$want" in
-        "" )                           list=(registry local) ;;
-        official|registry|官方|官方包) list=(registry) ;;
-        local|本地|本地包)             list=(local) ;;
-        * ) echo "未知来源：$want（可用：official / local）" >&2; return 2 ;;
-    esac
-    echo "预检：用当前 profile 试启目标槽位（不切换、不重启）"
-    for source in "${list[@]}"; do
-        echo "── $("${source}_label") ──"
-        if ! "${source}_ready"; then
-            echo "  跳过：尚未安装"
-            failed=1
-            continue
+# 用一个安装根（暂存件或全局树）试启 web。返回 0 = 给出应用级应答。
+preflight() {
+    local root="$1" home log port pid i code version
+    if [ "${DSHCTL_PREFLIGHT:-1}" = "0" ]; then
+        echo "  预检已跳过（DSHCTL_PREFLIGHT=0）"
+        return 0
+    fi
+    [ -x "$root/bin/dsh" ] || { echo "  预检：$root/bin/dsh 不存在" >&2; return 1; }
+    version=$("$root/bin/dsh" --version 2>/dev/null) || version=""
+    profile_pin_check "$version" || return 1
+    if ! port=$(preflight_free_port); then
+        echo "  预检：找不到空闲端口" >&2
+        return 1
+    fi
+    home=$(preflight_prepare_home "$port") || return 1
+    log="$home/preflight.log"
+    DSH_HOME="$home" setsid "$root/bin/dsh" web --host "$HOST" --port "$port" --no-open >"$log" 2>&1 &
+    pid=$!
+    for i in $(seq 1 "$PREFLIGHT_TRIES"); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            preflight_fail "$home" "$pid" "启动即退出"
+            return 1
         fi
-        preflight_slot "$source" || failed=1
-    done
-    if [ "$failed" = "0" ]; then
-        echo "结论：槽位可用"
-    else
-        echo "结论：有槽位不可用——切过去服务会起不来，预检已拦下" >&2
-    fi
-    return "$failed"
-}
-
-# 只切换运行槽位（不重装）：dshctl use official | local。
-use_source() {
-    local want="${1:-}"
-    if [ -z "$want" ]; then
-        echo "当前运行来源：$("$(current_source)"_label)"
-        echo "可切换：official（官方包，全局槽位） / local（本地包，槽位 $LOCAL_SLOT）"
-        return 0
-    fi
-    case "$want" in
-        official|registry|官方|官方包) want=registry ;;
-        local|本地|本地包)             want=local ;;
-    esac
-    if ! source_known "$want"; then
-        echo "未知来源：$want（可用：official / local）" >&2
-        return 2
-    fi
-    if [ "$(current_source)" = "$want" ]; then
-        echo "当前已经是 $("${want}_label")，无需切换。"
-        return 0
-    fi
-    if ! "${want}_ready"; then
-        case "$want" in
-            local) echo "本地槽位还没装好，先执行：dshctl update --local <源码仓库 | tgz 目录>" >&2 ;;
-            *)     echo "官方包还没装好，先执行：dshctl update <通道>（如 dshctl update next）" >&2 ;;
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$HOST:$port/" 2>/dev/null || true)
+        case "$code" in
+            401|303|200)
+                # 应答之后再确认进程还活着：起一秒就崩的制品会在这里现形。
+                sleep 1
+                if kill -0 "$pid" 2>/dev/null; then
+                    # 能应答不等于启动干净：可选 entry 激活失败只是 warning，
+                    # 服务照样应答 401，所以必须读日志。
+                    if grep -qE 'did not activate|startup failed' "$log" 2>/dev/null; then
+                        preflight_fail "$home" "$pid" "能应答，但启动日志里有 entry 未激活"
+                        return 1
+                    fi
+                    echo "  预检通过：能用 profile $PROFILE 启动"
+                    preflight_cleanup "$home" "$pid"
+                    return 0
+                fi
+                preflight_fail "$home" "$pid" "应答之后又退出了"
+                return 1
+                ;;
         esac
+        sleep 1
+    done
+    preflight_fail "$home" "$pid" "在 ${PREFLIGHT_TRIES}s 内没有给出应用级应答"
+    return 1
+}
+
+# 只预检：dshctl check。不安装、不重启。
+do_check() {
+    local prefix
+    prefix=$(npm_prefix) || { echo "读不到 npm 全局前缀" >&2; return 1; }
+    if [ ! -x "$prefix/bin/dsh" ]; then
+        echo "还没装：$prefix/bin/dsh（先跑 dshctl upgrade）" >&2
+        return 1
+    fi
+    echo "预检：已装版本 $(installed_version) 能否用 profile $PROFILE 启动（不重启）"
+    preflight "$prefix"
+}
+
+# ── 安装 / 升级主流程 ────────────────────────────────────────────────────
+# 四段：暂存 → 预检 → 提交 → 重启。顺序是这个函数存在的全部理由。
+do_upgrade() {
+    local tag want prev
+    tag=$(resolve_tag "${1:-}")
+    if ! valid_channel "$tag"; then
+        echo "无效的通道或版本：$tag" >&2
+        echo "可用：latest / next / alpha，或显式版本号（如 0.2.1-rc.5）" >&2
         return 2
     fi
-    local previous
-    previous=$(current_source)
+
+    echo "── [1/4] 目标 ──"
+    echo "  包：$PACKAGE_NAME@$tag（npm 全局树）"
+    echo "  当前版本：$(installed_version)"
+
     if [ "$DRY_RUN" = "1" ]; then
-        echo "── [dry-run] 会把运行来源切到 $("${want}_label")，然后重启服务 ──"
+        echo "  [dry-run] 将：暂存到隔离目录 → 用 profile $PROFILE 预检 → 提交全局树 → 重启"
+        echo "── [dry-run] 跳过安装与重启（去掉 --dry-run 才会真正执行）──"
         return 0
     fi
-    echo "── 切换前预检 ──"
-    if ! preflight_slot "$want"; then
-        echo "预检未通过：$("${want}_label") 用当前 profile 起不来，保持 $("${previous}_label") 运行（未做任何切换）。" >&2
+
+    echo "── [2/4] 暂存（不动正在运行的安装）──"
+    network_precheck || return 1
+    want=$(npm_view_version "$tag") || return 1
+    echo "  目标版本：$want"
+    if ! stage_install "$want"; then
+        echo "暂存失败：运行中的 $(installed_version) 没有被改动。" >&2
         return 1
     fi
-    if ! "${want}_bind"; then
+
+    echo "── [3/4] 预检 ──"
+    if ! preflight "$STAGE_ROOT"; then
+        rm -rf "$STAGE_ROOT"
+        echo "预检未通过：正式安装与运行中的服务都没有改动。" >&2
         return 1
     fi
+
+    echo "── [4/4] 提交并重启 ──"
+    prev=$(installed_version)
+    if ! commit_install "$want" "$prev"; then
+        rm -rf "$STAGE_ROOT"
+        echo "提交失败：全局树可能不完整，用 dshctl status / dshctl log 确认，必要时 dshctl repair。" >&2
+        return 1
+    fi
+    rm -rf "$STAGE_ROOT"
+    write_state "$CHANNEL_FILE" "$tag"
+
     if [ "$RESTART" = "0" ]; then
-        echo "已切换为 $("${want}_label")（未重启，下次启动生效）"
+        echo "── 已按 --no-restart 跳过重启；下次启动生效 ──"
+        warn_if_stale
         return 0
     fi
-    restart_checked "$previous"
+    restart_checked
 }
 
-# 展示当前运行来源、两个槽位与版本。
-show_source() {
-    local source detail
-    source=$(current_source)
-    echo "运行来源：$("${source}_label")"
-    echo "  服务入口：$(service_bin)"
-    if [ -f "$DROPIN" ]; then
-        echo "  切换文件：$DROPIN（存在 = 跑本地槽位）"
+# 首次安装：把 dshctl 放进 PATH、写服务单元，然后直接完成安装。
+do_install() {
+    local self bin_dir
+    self=$(readlink -f "${BASH_SOURCE[0]}")
+    bin_dir="$HOME/.local/bin"
+
+    echo "── [1/3] dshctl ──"
+    if [ "$(command -v dshctl 2>/dev/null)" = "$self" ]; then
+        echo "  ✓ 已在 PATH：$self"
     else
-        echo "  切换文件：无（跑官方槽位＝unit 原本的 ExecStart）"
+        mkdir -p "$bin_dir" || return 1
+        cp -f "$self" "$bin_dir/dshctl" && chmod 755 "$bin_dir/dshctl" || return 1
+        echo "  ✓ 已安装：$bin_dir/dshctl"
+        case ":$PATH:" in
+            *":$bin_dir:"*) ;;
+            *) echo "  ⚠ $bin_dir 不在 PATH，请加入 shell 配置：export PATH=\"$bin_dir:\$PATH\"" ;;
+        esac
     fi
-    case "$source" in
-        registry)
-            echo "  通道：$(current_channel)"
-            echo "  槽位：$(global_root)"
-            ;;
-        local)
-            echo "  槽位：$LOCAL_SLOT"
-            echo "  构建来源：$(read_path_state "$LOCAL_PATH_FILE")"
-            detail=$(read_state "$LOCAL_DETAIL_FILE")
-            [ -n "$detail" ] && echo "  制品：$detail"
-            ;;
-    esac
-    echo "官方槽位版本：$(slot_version registry)"
-    echo "本地槽位版本：$(slot_version local)"
-    echo
-    echo "切换（不重装）：dshctl use local / dshctl use official"
+
+    echo "── [2/3] 服务单元 ──"
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "  ⚠ 未找到 npm：先装 Node.js，再跑 dshctl install" >&2
+        return 1
+    fi
+    write_unit_file || return 1
+    echo "  ✓ $UNIT_FILE"
+
+    echo "── [3/3] 安装官方包 ──"
+    do_upgrade ""
 }
 
-# ── Docker 部署模式 ──────────────────────────────────────────────────────
-# dshctl docker up|down|restart|status|log|update
-# 与 systemd 双槽位是并行的部署形态：容器对外端口与 systemd 服务相同（默认 3080），
-# 两者同时跑会端口冲突，up/update 前先检测并拒绝。
-docker_usage() {
-    echo "用法：dshctl docker up|down|restart|status|log|update"
-    echo "  up       拉取镜像并启动容器（数据持久化到命名卷，开机自动拉起）"
-    echo "  down     停止并移除容器（数据卷保留，会话与配置不丢）"
-    echo "  restart  重启容器"
-    echo "  status   查看容器状态与应用应答"
-    echo "  log      查看最近容器日志"
-    echo "  update   拉最新镜像并重建容器，新容器起不来时自动回退旧镜像"
-    echo
-    echo "  镜像：$DOCKER_IMAGE（DSHCTL_DOCKER_IMAGE 可覆盖）"
-    echo "  端口：$DOCKER_PORT → 容器 3080（DSHCTL_DOCKER_PORT 可覆盖）"
-    echo "  认证：DSHCTL_DOCKER_AUTH_USER + DSHCTL_DOCKER_AUTH_PASS 同时设置则启用 Basic Auth"
+# ── 状态 ─────────────────────────────────────────────────────────────────
+show_info() {
+    local started
+    echo "单元：$UNIT（$(systemctl --user is-active "$UNIT" 2>/dev/null || echo 未运行)）"
+    echo "入口：$(dsh_bin 2>/dev/null || echo 未知)"
+    echo "已装版本：$(installed_version)"
+    echo "更新通道：$(current_channel)"
+    started=$(systemctl --user show "$UNIT" -p ActiveEnterTimestamp --value 2>/dev/null || true)
+    [ -n "$started" ] && echo "进程启动于：$started"
+    warn_if_stale
     return 0
 }
 
-docker_available() {
-    command -v docker >/dev/null 2>&1 || { echo "未找到 docker 命令，请先安装 Docker" >&2; return 1; }
-    docker info >/dev/null 2>&1 || { echo "docker daemon 未运行" >&2; return 1; }
-}
-
-# Basic Auth 凭证只以环境变量传给容器；含空白字符会破坏参数展开，直接拒绝（不猜）。
-# 注意 shell 的 &&/|| 是左结合，配对判断必须显式分组，否则「只设其一」会被绕过。
-docker_validate_auth() {
-    local varname
-    if [ -n "${DSHCTL_DOCKER_AUTH_USER:-}${DSHCTL_DOCKER_AUTH_PASS:-}" ]; then
-        if [ -z "${DSHCTL_DOCKER_AUTH_USER:-}" ] || [ -z "${DSHCTL_DOCKER_AUTH_PASS:-}" ]; then
-            echo "DSHCTL_DOCKER_AUTH_USER 与 DSHCTL_DOCKER_AUTH_PASS 必须同时设置才启用认证（只设一个会被镜像放行所有请求）" >&2
-            return 1
+# ── 迁移：清掉双槽位时代的遗留 ───────────────────────────────────────────
+# 那些 drop-in 会把服务指向早已没人维护的本地槽位——留着就是在撒谎。
+cleanup_legacy() {
+    local f changed=0
+    for f in $LEGACY_DROPINS; do
+        [ -f "$f" ] || continue
+        if rm -f "$f"; then
+            changed=1
+            echo "已删除废弃的槽位配置：$f"
         fi
-    fi
-    for varname in DSHCTL_DOCKER_AUTH_USER DSHCTL_DOCKER_AUTH_PASS; do
-        case "${!varname:-}" in
-            *[[:space:]]*)
-                echo "$varname 含空白字符，无法安全传参" >&2
-                return 1 ;;
-        esac
     done
-}
-
-# 用指定镜像（tag 或镜像 ID）启动容器。挂载配置始终由 $DOCKER_IMAGE 名称判断，
-# 与传入镜像解耦——update 回退用旧镜像 ID 重建时挂载保持原样。
-docker_run_container() {
-    local image="$1"
-    local -a run_args=(run -d --name "$DOCKER_CONTAINER" --restart unless-stopped
-        -p "${DOCKER_PORT}:3080"
-        -v "${DOCKER_DATA_VOLUME}:/root/.dsh")
-    case "$DOCKER_IMAGE" in
-        *admin*) run_args+=(-v "${DOCKER_INSTALL_VOLUME}:/opt/dsh") ;;
-    esac
-    if [ -n "${DSHCTL_DOCKER_AUTH_USER:-}" ]; then
-        run_args+=(-e "PROXY_USERNAME=${DSHCTL_DOCKER_AUTH_USER}"
-            -e "PROXY_PASSWORD=${DSHCTL_DOCKER_AUTH_PASS}")
-    fi
-    docker "${run_args[@]}" "$image" >/dev/null
-}
-
-# docker 与 systemd 服务共用对外端口；systemd 服务在跑时直接拒绝，避免起一半失败。
-docker_check_port_conflict() {
-    if systemctl --user is-active --quiet "$UNIT" 2>/dev/null; then
-        echo "systemd 服务 $UNIT 正在运行，与 docker 模式共用端口 $DOCKER_PORT 会冲突。" >&2
-        echo "先停掉其一：dshctl stop（停 systemd 服务，数据保留）" >&2
-        return 1
-    fi
-}
-
-docker_up() {
-    docker_validate_auth || return 1
-    if [ "$(docker container inspect -f '{{.State.Status}}' "$DOCKER_CONTAINER" 2>/dev/null)" = "running" ]; then
-        echo "容器已在运行：$DOCKER_CONTAINER"
-        docker_status
-        return 0
-    fi
-    docker_check_port_conflict || return 1
-    echo "── 启动 docker 部署 ──"
-    echo "  镜像：$DOCKER_IMAGE"
-    echo "  端口：$DOCKER_PORT（宿主）→ 3080（容器内代理）"
-    echo "  数据：卷 $DOCKER_DATA_VOLUME → /root/.dsh（stop/down 后保留）"
-    if ! spinner "拉取镜像" -- docker pull "$DOCKER_IMAGE"; then
-        return 1
-    fi
-    if ! spinner "启动容器" -- docker_run_container "$DOCKER_IMAGE"; then
-        echo "容器启动失败；若是端口占用，先 dshctl stop 停掉 systemd 服务再试" >&2
-        return 1
-    fi
-    if wait_healthy; then
-        echo "✓ 服务已就绪：$URL"
-        return 0
-    fi
-    echo "⚠ 容器已启动但健康检查未通过，查看日志：dshctl docker log" >&2
-    return 1
-}
-
-docker_down() {
-    if ! docker container inspect "$DOCKER_CONTAINER" >/dev/null 2>&1; then
-        echo "容器不存在：$DOCKER_CONTAINER"
-        return 0
-    fi
-    spinner "停止并移除容器" -- docker rm -f "$DOCKER_CONTAINER" || return 1
-    echo "✓ 已停止（数据卷 $DOCKER_DATA_VOLUME 保留，会话与配置不丢）"
-}
-
-docker_restart() {
-    docker container inspect "$DOCKER_CONTAINER" >/dev/null 2>&1 \
-        || { echo "容器不存在，先执行：dshctl docker up" >&2; return 1; }
-    spinner "重启容器" -- docker restart "$DOCKER_CONTAINER" || return 1
-    if wait_healthy; then
-        echo "✓ 服务已就绪：$URL"
-        return 0
-    fi
-    echo "⚠ 重启后健康检查未通过，查看日志：dshctl docker log" >&2
-    return 1
-}
-
-docker_status() {
-    if ! docker container inspect "$DOCKER_CONTAINER" >/dev/null 2>&1; then
-        echo "容器未创建（docker 模式未部署）。启动：dshctl docker up"
-        return 1
-    fi
-    docker ps -a --filter "name=^$DOCKER_CONTAINER\$" \
-        --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
-    local code
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$URL/" 2>/dev/null || true)
-    case "$code" in
-        ""|000) echo "应用应答：无（服务未就绪）" ;;
-        *)      echo "应用应答：HTTP $code（$URL）" ;;
-    esac
-}
-
-docker_log() {
-    docker container inspect "$DOCKER_CONTAINER" >/dev/null 2>&1 \
-        || { echo "容器不存在：$DOCKER_CONTAINER" >&2; return 1; }
-    docker logs --tail 100 "$DOCKER_CONTAINER"
-}
-
-# 拉最新镜像并重建容器。与双槽位预检同一硬约束：新镜像起不来就回退旧镜像，
-# 更新失败不能让服务躺着。
-docker_update() {
-    docker_validate_auth || return 1
-    local old_image new_image
-    old_image=$(docker container inspect -f '{{.Image}}' "$DOCKER_CONTAINER" 2>/dev/null)
-    if ! spinner "拉取最新镜像" -- docker pull "$DOCKER_IMAGE"; then
-        return 1
-    fi
-    new_image=$(docker image inspect -f '{{.Id}}' "$DOCKER_IMAGE" 2>/dev/null)
-    if [ -z "$new_image" ]; then
-        echo "读不到镜像 ID：$DOCKER_IMAGE" >&2
-        return 1
-    fi
-    if [ "$old_image" = "$new_image" ]; then
-        echo "✓ 镜像已是最新：$DOCKER_IMAGE"
-        return 0
-    fi
-    if [ "$DRY_RUN" = "1" ]; then
-        echo "── [dry-run] 会用新镜像重建容器并重启（去掉 --dry-run 才会真正执行）──"
-        return 0
-    fi
-    echo "  镜像有更新，重建容器（数据卷保留）..."
-    docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
-    if docker_run_container "$DOCKER_IMAGE" && wait_healthy; then
-        echo "✓ 已更新并就绪：$URL"
-        return 0
-    fi
-    echo "  新容器未就绪，回退到上一镜像..." >&2
-    docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
-    if [ -n "$old_image" ] && docker_run_container "$old_image" && wait_healthy; then
-        echo "  已回退到旧镜像，服务恢复运行；新镜像的问题可看：docker logs $DOCKER_CONTAINER" >&2
-    else
-        echo "  ✘ 回退也失败了，手动排查：docker pull $DOCKER_IMAGE && dshctl docker up" >&2
-    fi
-    return 1
-}
-
-do_docker() {
-    local action="${1:-}"
-    docker_available || return 1
-    # docker 模式的健康检查按容器状态 + 实际对外端口判断。
-    DSHCTL_MODE=docker
-    URL="http://127.0.0.1:$DOCKER_PORT"
-    case "$action" in
-        up)      docker_up ;;
-        down)    docker_down ;;
-        restart) docker_restart ;;
-        status)  docker_status ;;
-        log)     docker_log ;;
-        update)  docker_update ;;
-        "" )     docker_usage ;;
-        *)       echo "未知 docker 子命令：$action" >&2; echo; docker_usage; return 2 ;;
-    esac
+    [ "$changed" = "1" ] || return 0
+    rmdir "$LEGACY_DROPIN_DIR" 2>/dev/null || true
+    systemctl --user daemon-reload
+    echo "  服务现在按单元里的全局安装运行；重启后生效：dshctl restart"
+    return 0
 }
 
 # ── 交互菜单 ─────────────────────────────────────────────────────────────
 run_menu() {
+    local choice
     menu() {
         [ -t 0 ] && clear 2>/dev/null || true
         echo "========================================="
         echo "  dsh web 服务管理    $URL"
+        echo "  已装版本：$(installed_version)"
         echo "========================================="
-        echo "  1) 升级 dsh（运行来源 $("$(current_source)"_label)，升级并按需切换）"
+        echo "  1) 升级 dsh（官方包）"
         echo "  2) 查看运行状态"
         echo "  3) 查看最近日志"
         echo "  4) 重启服务"
@@ -1396,18 +787,15 @@ run_menu() {
         echo "  6) 启动服务"
         echo "  7) 取消开机自启"
         echo "  8) 查看完整说明（help）"
-        echo "  9) 切换更新通道并升级（latest/next/alpha）"
-        echo " 10) 从本地包安装/升级（源码仓库或 tgz 目录）"
-        echo " 11) 查看当前运行来源与两个槽位"
-        echo " 12) 只切换运行来源（官方包 ↔ 本地槽位）"
-        echo " 13) Docker 部署管理（up/down/status/log/update）"
-        echo " 14) 更新 dshctl 自身（update）"
-        echo " 15) 修复服务启动配置（repair，原配置先备份）"
+        echo "  9) 换通道并升级（latest/next/alpha）"
+        echo " 10) 预检当前安装（check）"
+        echo " 11) 修复服务单元（repair，原配置先备份）"
+        echo " 12) 更新 dshctl 自身（self-update）"
         echo "  0) 退出"
         echo "-----------------------------------------"
-        echo "  也可直接敲：dshctl upgrade [--local 路径] / dshctl docker up / dshctl update ..."
+        echo "  也可直接敲：dshctl upgrade next / dshctl status / dshctl log"
         echo "========================================="
-        printf '  请选择 [0-9] 或 10-15: '
+        printf '  请选择 [0-9] 或 10-12: '
     }
     pause() {
         echo
@@ -1419,68 +807,73 @@ run_menu() {
         read -r choice || { echo; break; }
         echo
         case "$choice" in
-            1) do_install "$(current_source)" "" ;;
-            2) systemctl --user --no-pager status "$UNIT" ;;
-            3) journalctl --user -u "$UNIT" -n 100 --no-pager ;;
-            4) systemctl --user restart "$UNIT" ;;
-            5) systemctl --user stop "$UNIT" ;;
-            6) systemctl --user start "$UNIT" ;;
-            7) systemctl --user disable "$UNIT" ;;
-            8) show_usage ;;
-            9) printf '  输入通道名（latest/next/alpha）: '
-               read -r tag || true
-               [ -n "${tag:-}" ] && do_install registry "$tag" ;;
-            10) printf '  输入本地路径（源码仓库 / 含 tgz 的目录 / 某个 .tgz；直接回车用记住的）: '
-                read -r local_path || true
-                do_install local "$local_path" ;;
-            11) show_source ;;
-            12) printf '  切到哪个？1) 官方包  2) 本地槽位 : '
-                read -r pick || true
-                case "${pick:-}" in
-                    1) use_source registry ;;
-                    2) use_source local ;;
-                    *) echo "  已取消" ;;
-                esac ;;
-            13) printf '  Docker 操作（up/down/restart/status/log/update）: '
-                read -r dact || true
-                case "${dact:-}" in
-                    up|down|restart|status|log|update) do_docker "$dact" ;;
-                    *) docker_available && docker_usage ;;
-                esac ;;
-            14) self_update ;;
-            15) repair_service ;;
-            0) break ;;
-            *) echo "无效选择：$choice（请输入 0-9 或 10-15）" ;;
+            1)  do_upgrade "" ;;
+            2)  systemctl --user --no-pager status "$UNIT"; echo; show_info ;;
+            3)  journalctl --user -u "$UNIT" -n 100 --no-pager ;;
+            4)  restart_service ;;
+            5)  systemctl --user stop "$UNIT" ;;
+            6)  systemctl --user start "$UNIT" ;;
+            7)  systemctl --user disable "$UNIT" ;;
+            8)  show_usage ;;
+            9)  printf '  输入通道名（latest/next/alpha）: '
+                read -r tag || true
+                [ -n "${tag:-}" ] && do_upgrade "$tag" ;;
+            10) do_check ;;
+            11) repair_service ;;
+            12) self_update ;;
+            0)  break ;;
+            *)  echo "无效选择：$choice（请输入 0-9 或 10-12）" ;;
         esac
         pause
     done
 }
 
-# ── 命令入口 ─────────────────────────────────────────────────────────────
 # ── 帮助 ─────────────────────────────────────────────────────────────────
-# 打印帮助。带子命令时先给该子命令的用法，再给完整说明；只输出，不产生任何副作用。
+default_help_text() {
+    cat <<'EOF'
+dshctl - dsh web 服务的安装、升级与托管（只针对官方 npm 包）
+
+常用命令：
+  dshctl upgrade [通道|版本]  安装/升级官方包（默认沿用记住的通道）
+  dshctl install              首次安装：dshctl 进 PATH + 写服务单元 + 装包
+  dshctl status               服务状态、已装版本、是否在跑旧代码
+  dshctl restart|start|stop   服务控制
+  dshctl log                  最近日志
+  dshctl check                预检当前安装能否用 profile 启动（不重启）
+  dshctl repair               重建服务单元（原配置先备份）
+  dshctl self-update          更新 dshctl 自身
+  dshctl help                 显示帮助信息
+
+升级为什么不会把服务升挂：
+  1) 先把目标版本装进隔离的暂存目录，全局 npm 树与运行中的服务一行都不动；
+  2) 用 profile web 在临时 DSH_HOME + 空闲端口试启暂存件，起不来就到此为止；
+  3) 通过后才提交到全局树并重启，重启失败自动装回上一个版本。
+  注意：预检用的临时 home 会把 profile 里写死的监听端口改到空闲端口（仅副本），
+  否则试启会和线上服务抢同一个端口。
+  dshctl status 会提示「磁盘上的包是否比运行中的进程新」——升级后没重启、或手工
+  动过全局树时会出现那行告警，按提示 restart 即可。
+
+通用开关：--dry-run 只说不做；--no-restart 装完不重启。
+无参数运行时进入交互菜单。
+EOF
+}
+
 show_usage() {
     case "${1:-}" in
-        update|u)     echo "用法：dshctl update（更新 dshctl 自身；升级 dsh 请用 dshctl upgrade）" ;;
-        upgrade|up)   echo "用法：dshctl upgrade [通道|版本] [--local 路径] [--registry] [--dry-run] [--no-restart]" ;;
-        install)      echo "用法：dshctl install [--docker]（首次安装：装 dshctl + 服务骨架）" ;;
-        repair)       echo "用法：dshctl repair [--dry-run] [--no-restart]（备份并重建 systemd 启动配置）" ;;
-        use|switch)   echo "用法：dshctl use official|local" ;;
-        check|verify) echo "用法：dshctl check [official|local]（只预检能否用当前 profile 启动，不切换、不重启）" ;;
-        docker)       echo "用法：dshctl docker up|down|restart|status|log|update（容器化部署，镜像可用 DSHCTL_DOCKER_IMAGE 覆盖）" ;;
-        "" )          ;;
+        upgrade|up)   echo "用法：dshctl upgrade [通道|版本] [--dry-run] [--no-restart]" ;;
+        install)      echo "用法：dshctl install（首次安装：dshctl 进 PATH + 写服务单元 + 装包）" ;;
+        status)       echo "用法：dshctl status" ;;
+        check|verify) echo "用法：dshctl check（预检当前安装，不安装不重启）" ;;
+        repair)       echo "用法：dshctl repair [--dry-run] [--no-restart]（备份并重建服务单元）" ;;
+        self-update)  echo "用法：dshctl self-update [--dry-run]" ;;
+        "")           ;;
         *)            echo "用法：dshctl $1" ;;
     esac
-    if [ -f "$HELP" ]; then
-        cat "$HELP"
-        echo
-        echo "修复启动配置：dshctl repair [--dry-run] [--no-restart]（原配置先备份）"
-    else
-        default_help_text
-    fi
+    default_help_text
     return 0
 }
 
+# ── 入口 ─────────────────────────────────────────────────────────────────
 main() {
     local arg
     # 帮助优先：命令行里只要有 help / -h / --help，就只打印帮助，绝不执行子命令。
@@ -1494,42 +887,18 @@ main() {
                 return 0 ;;
         esac
     done
-    # 过程开关之外的「- 开头」参数都算不认识：宁可拒绝执行，也不当普通参数猜。
-    # 模式必须写死在 case 里：变量展开里的「|」是普通字符，不做备选。
+    # 「- 开头」的未知参数一律拒绝执行：宁可让用户重敲，也不猜他想干什么。
     for arg in "$@"; do
         case "$arg" in
             --dry-run|-n|--no-restart) ;;
-            --local|-l|--registry|-r)
-                case "${1:-}" in
-                    update|u|upgrade|up) ;;
-                    *)
-                        echo "未知参数：$arg" >&2
-                        echo
-                        show_usage "${1:-}"
-                        return 2
-                        ;;
-                esac
-                ;;
-            --docker|-d)
-                case "${1:-}" in
-                    install) ;;
-                    *)
-                        echo "未知参数：$arg" >&2
-                        echo
-                        show_usage "${1:-}"
-                        return 2
-                        ;;
-                esac
-                ;;
             -*)
                 echo "未知参数：$arg" >&2
                 echo
                 show_usage "${1:-}"
-                return 2
-                ;;
+                return 2 ;;
         esac
     done
-    # 再摘掉 --dry-run / --no-restart：它们只是过程开关，不该混进路径 / 通道参数里。
+    # 再摘掉过程开关，它们不该混进通道 / 版本参数里。
     local -a args=()
     for arg in "$@"; do
         case "$arg" in
@@ -1540,48 +909,41 @@ main() {
     done
     set -- "${args[@]}"
 
+    cleanup_legacy
+
     case "${1:-}" in
-        "" )              run_menu ;;
+        "" )                    run_menu ;;
+        upgrade|up)             do_upgrade "${2:-}" ;;
+        install)                do_install ;;
+        status|s)               systemctl --user --no-pager status "$UNIT"; echo; show_info ;;
+        log|l)                  journalctl --user -u "$UNIT" -n 100 --no-pager ;;
+        restart|r)              restart_service ;;
+        stop)                   systemctl --user stop "$UNIT" ;;
+        start)                  systemctl --user start "$UNIT" ;;
+        disable)                systemctl --user disable "$UNIT" ;;
+        check|verify)           do_check ;;
+        repair)                 shift; repair_service "$@" ;;
+        self-update)            self_update ;;
+        help|h|-h|--help)       show_usage "${2:-}" ;;
+        # 这几个是已删除的功能：明确说清楚去哪，别让肌肉记忆撞空。
+        source|src)
+            echo "「运行来源」已删除：只有官方包一种安装，装的就是跑的。" >&2
+            echo "看版本和服务状态：dshctl status" >&2
+            return 2 ;;
+        use|switch)
+            echo "槽位切换已删除：没有第二个安装位置，也就没有来源可切。" >&2
+            echo "安装/升级：dshctl upgrade [通道|版本]" >&2
+            return 2 ;;
+        docker)
+            echo "docker 部署模式已删除：只保留官方包 + systemd 一条路。" >&2
+            return 2 ;;
         update|u)
-            # v0.4 起 update 只管 dshctl 自身；带参数的旧用法转发到 upgrade（提示迁移）。
-            if [ "${2:-}" = "" ] || [ "${2:-}" = "--dry-run" ] || [ "${2:-}" = "-n" ]; then
-                self_update
-            else
-                echo "⚠ v0.4 起 dshctl update 只更新 dshctl 自身；升级 dsh 请用 dshctl upgrade" >&2
-                echo "  本次已按旧语义继续执行：" >&2
-                case "${2:-}" in
-                    --local|-l)    do_install local "${3:-}" ;;
-                    --registry|-r) do_install registry "${3:-}" ;;
-                    * )            do_install registry "${2:-}" ;;
-                esac
-            fi ;;
-        upgrade|up)
-            case "${2:-}" in
-                "" )           do_install "$(current_source)" "" ;;
-                --local|-l)    do_install local "${3:-}" ;;
-                --registry|-r) do_install registry "${3:-}" ;;
-                * )            do_install registry "$2" ;;
-            esac ;;
-        install)          do_install_cmd "${2:-}" ;;
-        repair)           shift; repair_service "$@" ;;
-        update-local|local|ul)
-            echo "提示：新版命令是 dshctl upgrade --local（旧写法仍可用）" >&2
-            do_install local "${2:-}" ;;
-        use|switch)       use_source "${2:-}" ;;
-        check|verify)     check_slots "${2:-}" ;;
-        source|src)       show_source ;;
-        docker)           do_docker "${2:-}" ;;
-        status|s)         systemctl --user --no-pager status "$UNIT" ;;
-        log|l)            journalctl --user -u "$UNIT" -n 100 --no-pager ;;
-        restart|r)        systemctl --user restart "$UNIT" ;;
-        stop)             systemctl --user stop "$UNIT" ;;
-        start)            systemctl --user start "$UNIT" ;;
-        disable)          systemctl --user disable "$UNIT" ;;
-        help|h|-h|--help) show_usage "${2:-}" ;;
+            echo "「update」有歧义，已停用：升级 dsh 用 dshctl upgrade，更新 dshctl 自身用 dshctl self-update。" >&2
+            return 2 ;;
         * )
             echo "未知命令：$1" >&2
             echo
-            cat "$HELP"
+            show_usage
             return 1 ;;
     esac
 }

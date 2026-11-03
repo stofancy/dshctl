@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 在临时目录验证修复流程；systemctl/npm/curl 使用替身，不操作本机服务。
+# 在临时目录验证 repair 流程；systemctl/npm/curl 使用替身，不操作本机服务。
+# 0.6 起没有槽位：repair 只重建单元，不再理会任何 drop-in 或本地槽位。
 set -eu
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 test_dir=$(mktemp -d)
@@ -9,19 +10,14 @@ setup() {
     source "$repo_dir/dshctl"
     fixture="$test_dir/$1"
     UNIT_FILE="$fixture/systemd/$UNIT"
-    DROPIN_DIR="$UNIT_FILE.d"
-    DROPIN="$DROPIN_DIR/50-dshctl-slot.conf"
-    LEGACY_DROPIN="$DROPIN_DIR/50-dshctl-source.conf"
     STATE_DIR="$fixture/state"
-    LOCAL_SLOT="$fixture/local"
-    HELP="$fixture/help.txt"
     calls="$fixture/calls"
-    mkdir -p "$DROPIN_DIR" "$STATE_DIR" "$fixture/npm/bin" "$LOCAL_SLOT/bin"
+    mkdir -p "$(dirname "$UNIT_FILE")" "$STATE_DIR" "$fixture/npm/bin" "$UNIT_FILE.d"
     printf '#!/bin/sh\nexit 0\n' > "$fixture/npm/bin/dsh"
-    cp "$fixture/npm/bin/dsh" "$LOCAL_SLOT/bin/dsh"
-    chmod +x "$fixture/npm/bin/dsh" "$LOCAL_SLOT/bin/dsh"
+    chmod +x "$fixture/npm/bin/dsh"
     printf 'old unit\n' > "$UNIT_FILE"
-    printf '[Service]\nEnvironment=KEEP_ME=yes\n' > "$DROPIN_DIR/90-custom.conf"
+    # 别人写的 drop-in：repair 不能动它。
+    printf '[Service]\nEnvironment=KEEP_ME=yes\n' > "$UNIT_FILE.d/90-custom.conf"
     printf 'keep channel and data\n' > "$STATE_DIR/data"
     : > "$calls"
     reload_status=0
@@ -38,7 +34,6 @@ npm() {
 systemctl() {
     printf '%s\n' "$*" >> "$calls"
     case "$*" in
-        *FragmentPath*) printf '%s\n' "$UNIT_FILE" ;;
         '--user daemon-reload') return "$reload_status" ;;
         '--user reset-failed '*) return "$reset_status" ;;
         '--user is-failed --quiet '*) return "$failed_status" ;;
@@ -62,7 +57,7 @@ expect_status() {
 }
 assert_preserved() {
     [ "$(cat "$STATE_DIR/data")" = 'keep channel and data' ]
-    [ "$(cat "$DROPIN_DIR/90-custom.conf")" = $'[Service]\nEnvironment=KEEP_ME=yes' ]
+    [ "$(cat "$UNIT_FILE.d/90-custom.conf")" = $'[Service]\nEnvironment=KEEP_ME=yes' ]
 }
 assert_no_call() {
     if grep -E -- "$1" "$calls"; then
@@ -71,27 +66,13 @@ assert_no_call() {
     fi
 }
 
-test_registry() {
-    setup registry
-    printf 'legacy\n' > "$LEGACY_DROPIN"
+test_repair() {
+    setup repair
     expect_status 0 main repair
     grep -Fxq "ExecStart=$fixture/npm/bin/dsh web --host 127.0.0.1 --port 3080" "$UNIT_FILE"
-    [ ! -e "$DROPIN" ]
-    [ ! -e "$LEGACY_DROPIN" ]
     [ "$(cat "$STATE_DIR"/service-backup.*/dsh-web.service)" = 'old unit' ]
-    [ "$(cat "$STATE_DIR"/service-backup.*/50-dshctl-source.conf)" = legacy ]
     grep -Fxq -- '--user reset-failed dsh-web.service' "$calls"
     grep -Fxq -- '--user restart dsh-web.service' "$calls"
-    assert_preserved
-}
-test_local() {
-    setup local
-    printf 'old local binding\n' > "$DROPIN"
-    expect_status 0 main repair --no-restart
-    grep -Fq "$LOCAL_SLOT/bin/dsh web --host 127.0.0.1 --port 3080" "$DROPIN"
-    [ "$(cat "$STATE_DIR"/service-backup.*/50-dshctl-slot.conf)" = 'old local binding' ]
-    assert_no_call 'restart|reset-failed'
-    [ "$(current_source)" = local ]
     assert_preserved
 }
 test_read_only() {
@@ -157,7 +138,7 @@ test_failures() {
     expect_status 1 main repair
 }
 
-for test in registry local read_only missing_package missing_unit linked_unit failures; do
+for test in repair read_only missing_package missing_unit linked_unit failures; do
     ("test_$test")
     printf 'PASS %s\n' "$test"
 done
